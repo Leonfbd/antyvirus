@@ -341,6 +341,120 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_processes(args: argparse.Namespace) -> int:
+    """Skanuje uruchomione procesy i ocenia ich obrazy na dysku."""
+    cfg = Config()
+    cfg.ensure_dirs()
+    engine = Engine(cfg)
+    engine.load()
+    try:
+        from .processes import ProcessScanner
+    except ImportError as exc:
+        print(f"Brak zależności: {exc}")
+        return 2
+
+    print("Skanowanie procesów…\n")
+    report = ProcessScanner(engine).scan()
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 1 if report["counts"]["malicious"] else 0
+
+    counts = report["counts"]
+    print(f"{BOLD}Procesy:{RESET} {counts['total']} "
+          f"| złośliwe: {_color(str(counts['malicious']), 'malicious')} "
+          f"| podejrzane: {_color(str(counts['suspicious']), 'suspicious')} "
+          f"| czyste: {counts['clean']}")
+    print(f"przeskanowanych plików wykonywalnych: {report.get('scanned_binaries', 0)}\n")
+
+    if not report["threats"]:
+        print("Nie wykryto podejrzanych procesów.")
+        return 0
+
+    for p in report["threats"][:args.limit]:
+        label = _color(VERDICT_PL.get(p["verdict"], p["verdict"]), p["verdict"])
+        print(f"{label} pid={p['pid']}  {p['name']}")
+        print(f"  exe:     {p['exe'] or '(brak)'}")
+        if p["cmdline"]:
+            print(f"  cmdline: {p['cmdline'][:150]}")
+        print(f"  użytkownik: {p['username']} · połączenia: {p['connections']}")
+        for f in p["findings"]:
+            print(f"   ! +{f['weight']:<3} {f['rule']}: {f['description']}")
+        print()
+    return 1 if counts["malicious"] else 0
+
+
+def cmd_startup(args: argparse.Namespace) -> int:
+    """Audyt miejsc autostartu - gdzie system uruchamia kod bez pytania."""
+    cfg = Config()
+    cfg.ensure_dirs()
+    engine = Engine(cfg)
+    engine.load()
+    from .startup_audit import StartupAuditor
+
+    print("Audyt autostartu…\n")
+    report = StartupAuditor(engine).audit()
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 1 if report["counts"]["malicious"] else 0
+
+    counts = report["counts"]
+    print(f"{BOLD}Wpisy autostartu:{RESET} {counts['total']} "
+          f"| wysokiego ryzyka: {_color(str(counts['high_risk']), 'malicious')} "
+          f"| średniego: {_color(str(counts['medium_risk']), 'suspicious')} "
+          f"| złośliwych plików: {counts['malicious']} "
+          f"| osieroconych: {counts['missing_target']}\n")
+
+    shown = 0
+    for entry in report["entries"]:
+        if entry["score"] == 0 and not args.all:
+            continue
+        shown += 1
+        if shown > args.limit:
+            break
+        color = "malicious" if entry["score"] >= 60 else (
+            "suspicious" if entry["score"] >= 25 else "clean")
+        print(f"{_color(entry['risk'].upper(), color)} "
+              f"({entry['score']} pkt) {entry['name']}")
+        print(f"  lokalizacja: {entry['location']}")
+        print(f"  komenda:     {entry['command'][:160]}")
+        if entry["target"]:
+            status = "OK" if entry["exists"] else "NIE ISTNIEJE"
+            print(f"  plik:        {entry['target']} [{status}]")
+        for f in entry["findings"]:
+            print(f"   ! +{f['weight']:<3} {f['rule']}: {f['description']}")
+        print()
+    if not shown:
+        print("Nie znaleziono podejrzanych wpisów autostartu.")
+    return 1 if counts["malicious"] else 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """Skan + raport HTML/JSON do pliku."""
+    cfg = Config()
+    cfg.ensure_dirs()
+    storage = Storage(cfg.db_path)
+    engine = Engine(cfg, storage=storage)
+    engine.load()
+    cfg.quarantine_enabled = False       # raport nie powinien niczego przenosić
+
+    summary = engine.scan_paths(args.paths, workers=args.workers)
+    meta = {
+        "version": engine.VERSION,
+        "hostname": os.uname().nodename if hasattr(os, "uname") else "windows",
+        "signatures": engine.store.stats.to_dict(),
+    }
+
+    from .report import write_report
+    target = args.output or f"raport-skanu.{args.format}"
+    path = write_report(summary, target, fmt=args.format, meta=meta)
+    print(f"Raport zapisany: {path}")
+    print(f"  plików: {summary.total} · złośliwych: {summary.malicious} "
+          f"· podejrzanych: {summary.suspicious}")
+    return 1 if summary.malicious else 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="avy",
@@ -407,6 +521,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("value", help="plik lub skrót")
     p.add_argument("name", nargs="?", default=None)
     p.set_defaults(func=cmd_ioc)
+
+    # processes
+    p = sub.add_parser("processes", help="skanuj uruchomione procesy")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=int, default=30)
+    p.set_defaults(func=cmd_processes)
+
+    # startup
+    p = sub.add_parser("startup", help="audyt miejsc autostartu")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--all", action="store_true", help="pokaż też wpisy bez ryzyka")
+    p.add_argument("--limit", type=int, default=40)
+    p.set_defaults(func=cmd_startup)
+
+    # report
+    p = sub.add_parser("report", help="skan + raport HTML/JSON")
+    p.add_argument("paths", nargs="+")
+    p.add_argument("--format", choices=["html", "json", "txt"], default="html")
+    p.add_argument("-o", "--output", default=None)
+    p.add_argument("--workers", type=int, default=0)
+    p.set_defaults(func=cmd_report)
 
     # serve
     p = sub.add_parser("serve", help="uruchom panel WWW")

@@ -1,0 +1,24 @@
+# Reguły YARA wyłączone z punktacji - lista tłumień.
+#
+# Publiczne bazy reguł (Yara-Rules/rules, Neo23x0/signature-base) są darmowe
+# i utrzymywane przez społeczność, więc trafiają się w nich reguły zepsute:
+# ze zbyt ogólnymi wzorcami, które flagują niemal każdy plik. Komercyjne
+# silniki robią dokładnie to samo - prowadzą własne listy wyłączeń i testują
+# sygnatury na korpusie czystych plików.
+#
+# Silnik robi to automatycznie testem kanarkowym (reguła pasująca do danych
+# losowych, zerowych albo do czystych binarek systemowych odpada). Ten plik
+# jest na przypadki, których automat nie wychwyci - każdy wpis ma powód.
+#
+# Format: jedna nazwa reguły na linię. Linie zaczynające się od # są komentarzem.
+# Wpisy użytkownika można też trzymać w data/sigs/suppressed_rules.txt.
+
+# Wzorce: /version|ls|cd|sysinfo|download|upload|.../ oraz /BADD|Bad Error Happened|/
+# Druga z nich ma pustą gałąź alternatywy (końcowe "|"), więc pasuje do pustego
+# ciągu, czyli do KAŻDEGO pliku. W efekcie reguła wymaga tylko jednego dodatkowego
+# trafienia ("Affine" - nazwa funkcji z bibliotek kryptograficznych, obecna m.in.
+# w binarkach Go) i fałszuje np. /usr/bin/envd, /usr/bin/sshd.
+PoetRat_Python
+
+# Wzorce typu "http", "com", "net" - pasują do każdego pliku binarnego.
+Misc_Suspicious_Strings

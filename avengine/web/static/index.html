@@ -27,6 +27,8 @@
   <button class="tab" data-tab="scan">Skanowanie</button>
   <button class="tab" data-tab="threats">Wykrycia</button>
   <button class="tab" data-tab="quarantine">Kwarantanna</button>
+  <button class="tab" data-tab="processes">Procesy</button>
+  <button class="tab" data-tab="startup">Autostart</button>
   <button class="tab" data-tab="sigs">Sygnatury</button>
   <button class="tab" data-tab="settings">Ustawienia</button>
 </nav>
@@ -140,6 +142,43 @@
         <button class="btn btn-ghost" id="btnRefreshQuarantine">Odśwież</button>
       </div>
       <div id="quarantineList" class="list"><p class="muted">Pusto.</p></div>
+    </div>
+  </section>
+
+  <!-- ========================== PROCESY ============================= -->
+  <section id="processes" class="tab-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>Uruchomione procesy</h2>
+        <div>
+          <span id="procAge" class="muted" style="margin-right:10px"></span>
+          <button class="btn btn-ghost" id="btnRefreshProc">Odśwież</button>
+        </div>
+      </div>
+      <p class="note">Silnik sprawdza, z jakiego pliku wystartował każdy proces,
+        czy ten plik istnieje, czy nie podszywa się pod proces systemowy i czy
+        sam nie jest złośliwy. Nie zagląda w pamięć procesu (wymagałoby to
+        sterownika kernelowego).</p>
+      <div id="procSummary" class="cards" style="margin-top:12px"></div>
+      <div id="procList"></div>
+    </div>
+  </section>
+
+  <!-- ========================== AUTOSTART =========================== -->
+  <section id="startup" class="tab-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>Miejsca autostartu</h2>
+        <div>
+          <span id="startAge" class="muted" style="margin-right:10px"></span>
+          <button class="btn btn-ghost" id="btnRefreshStartup">Odśwież</button>
+        </div>
+      </div>
+      <p class="note">Utrwalanie się (persistence) to drugi krok niemal każdej
+        infekcji. Poniżej wszystkie miejsca, z których system uruchamia kod
+        bez pytania użytkownika — wraz z oceną tego, co z nich wystartuje.</p>
+      <div id="startSummary" class="cards" style="margin-top:12px"></div>
+      <div id="startList"></div>
     </div>
   </section>
 

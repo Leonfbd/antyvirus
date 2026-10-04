@@ -62,6 +62,11 @@ def detect(data: bytes, path: str = "") -> str:
                 return "script"
             return kind
 
+    # TAR nie ma magii na początku pliku - sprawdzamy go przed fallbackiem
+    # po rozszerzeniu (inaczej "x.tar" zostałby rozpoznany po nazwie).
+    if is_tar(data):
+        return "tar"
+
     # Pliki bez magii - rozstrzygamy po rozszerzeniu i treści.
     ext = _ext(path)
     if ext in SCRIPT_EXT:
@@ -80,6 +85,30 @@ def detect(data: bytes, path: str = "") -> str:
     if non_text / max(1, len(sample)) > 0.05:
         return "binary"
     return "text"
+
+
+def is_tar(data: bytes) -> bool:
+    """TAR ma magię "ustar" dopiero na offsecie 257 (brak magii na początku)."""
+    if len(data) < 512:
+        return False
+    if data[257:262] == b"ustar":
+        return True
+    # Starszy format GNU bez pola magic - weryfikujemy sumę kontrolną nagłówka.
+    try:
+        checksum_field = data[148:156].strip()
+        if not checksum_field or not checksum_field[:6].isdigit():
+            # Suma bywa zapisana ósemkowo ze spacjami - bierzemy pierwsze cyfry.
+            digits = b"".join(c for c in checksum_field if c.isdigit())
+            if not digits:
+                return False
+            stored = int(digits)
+        else:
+            stored = int(checksum_field.split(b"\x00")[0].strip() or b"0")
+        header = bytearray(data[:512])
+        header[148:156] = b" " * 8
+        return sum(header) == stored
+    except Exception:
+        return False
 
 
 def is_pe(data: bytes) -> bool:
@@ -114,7 +143,7 @@ def is_scannable(kind: str) -> bool:
     """Czy typ pliku niesie ryzyko warte analizy."""
     return kind in {
         "pe", "elf", "macho", "dos", "script", "archive", "zip", "rar", "7z",
-        "ole", "pdf", "binary", "xml",
+        "ole", "pdf", "binary", "xml", "tar", "gzip", "xz", "zstd",
     }
 
 

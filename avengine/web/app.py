@@ -48,6 +48,13 @@ class AVWebApp:
         self.config = config or engine.config
         self.jobs: Dict[str, ScanJob] = {}
         self._lock = threading.Lock()
+        # Skan procesów i audyt autostartu skanują też pliki binarne, więc
+        # trwają dziesiątki sekund - wyniki cache'ujemy i odświeżamy w tle.
+        self._cache: Dict[str, Dict[str, object]] = {
+            "processes": {"ts": 0.0, "state": "never", "data": None},
+            "startup": {"ts": 0.0, "state": "never", "data": None},
+        }
+        self.cache_ttl = 120
         self.app = self._build()
 
     # ------------------------------------------------------------------ budowa
@@ -158,6 +165,21 @@ class AVWebApp:
                 setattr(self.config, key, value)
             self.config.save()
             return self.config.to_dict()
+
+        @app.get("/api/processes")
+        def processes(refresh: int = 0):
+            return self._cached("processes", refresh)
+
+        @app.get("/api/startup")
+        def startup(refresh: int = 0):
+            return self._cached("startup", refresh)
+
+        @app.get("/api/report/{job_id}")
+        def report(job_id: str, fmt: str = "html"):
+            job = self.jobs.get(job_id)
+            if not job or not job.summary:
+                raise HTTPException(404, "Brak wyników dla tego zadania")
+            return self._render_report(job, fmt)
 
         @app.get("/api/browse")
         def browse(path: str = ""):
@@ -294,6 +316,71 @@ class AVWebApp:
             self.config.realtime_enabled = False
         self.config.save()
         return {"realtime": self.monitor.status(), "detail": result}
+
+    # ------------------------------------------------- procesy / autostart
+    def _cached(self, kind: str, refresh: int) -> Dict[str, object]:
+        entry = self._cache[kind]
+        age = time.time() - float(entry["ts"])
+        if refresh or entry["data"] is None or age > self.cache_ttl:
+            if entry["state"] != "running":
+                entry["state"] = "running"
+                threading.Thread(target=self._run_audit, args=(kind,), daemon=True).start()
+            return {
+                "state": "running",
+                "cached_at": entry["ts"],
+                "age_seconds": int(age),
+                "data": entry["data"],
+            }
+        return {"state": "ready", "cached_at": entry["ts"],
+                "age_seconds": int(age), "data": entry["data"]}
+
+    def _run_audit(self, kind: str) -> None:
+        entry = self._cache[kind]
+        try:
+            if kind == "processes":
+                from ..processes import ProcessScanner
+                data: object = ProcessScanner(self.engine).scan()
+            else:
+                from ..startup_audit import StartupAuditor
+                data = StartupAuditor(self.engine).audit()
+            entry["data"] = data
+            entry["state"] = "ready"
+        except ImportError as exc:
+            entry["data"] = {"error": str(exc)}
+            entry["state"] = "error"
+        except Exception as exc:
+            entry["data"] = {"error": f"{type(exc).__name__}: {exc}"}
+            entry["state"] = "error"
+        entry["ts"] = time.time()
+
+    # ------------------------------------------------------------- raporty
+    def _render_report(self, job: ScanJob, fmt: str):
+        from fastapi.responses import Response
+        from ..models import ScanResult, ScanSummary
+        from ..report import render_html, render_json, render_text
+
+        summary = ScanSummary()
+        for raw in (job.summary or {}).get("results", []):
+            result = ScanResult(path=raw.get("path", ""))
+            for key, value in raw.items():
+                if hasattr(result, key) and key != "findings":
+                    setattr(result, key, value)
+            from ..models import Finding
+            result.findings = [Finding(**f) for f in raw.get("findings", [])]
+            summary.ingest(result)
+            summary.results.append(result)
+
+        meta = {
+            "version": self.engine.VERSION,
+            "hostname": os.uname().nodename if hasattr(os, "uname") else "windows",
+            "signatures": self.engine.store.stats.to_dict(),
+        }
+        if fmt == "json":
+            return Response(render_json(summary, meta),
+                            media_type="application/json")
+        if fmt == "txt":
+            return Response(render_text(summary), media_type="text/plain")
+        return Response(render_html(summary, meta), media_type="text/html")
 
     def _browse(self, path: str) -> List[Dict[str, str]]:
         base = Path(path).expanduser() if path else Path.home()

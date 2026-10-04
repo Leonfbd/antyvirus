@@ -27,6 +27,24 @@ class Config:
     max_file_size: int = 200 * 1024 * 1024  # pomijamy większe pliki
     max_workers: int = 8
 
+    # --- archiwa (ochrona przed bombami zip i wykładniczym zagnieżdżeniem) ---
+    # --- wydajność ---
+    # ssdeep to czysty Python: ~11 s dla 12 MB. Liczymy go tylko wtedy, gdy
+    # baza zawiera hasze fuzzy (inaczej i tak nikt go nie użyje).
+    max_fuzzy_size: int = 8 * 1024 * 1024
+    # Reguły YARA sklasyfikowane jako „info" dają 0 punktów, a kosztują
+    # najwięcej (pasują do wszystkiego). Na dużych plikach je pomijamy.
+    yara_info_max_size: int = 1024 * 1024
+    # Entropia z próbki zamiast z całego pliku powyżej tego rozmiaru.
+    entropy_sample_threshold: int = 4 * 1024 * 1024
+    entropy_sample_size: int = 2 * 1024 * 1024
+
+    max_archive_depth: int = 3
+    max_archive_members: int = 300
+    max_member_size: int = 50 * 1024 * 1024
+    max_total_extracted: int = 200 * 1024 * 1024
+    max_compression_ratio: int = 200
+
     # --- zachowanie ---
     quarantine_enabled: bool = True
     quarantine_on_malicious: bool = True

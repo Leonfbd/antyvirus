@@ -47,6 +47,8 @@ $$('.tab').forEach((tab) => tab.addEventListener('click', () => {
   $(`#${tab.dataset.tab}`).classList.add('active');
   if (tab.dataset.tab === 'threats') loadDetections();
   if (tab.dataset.tab === 'quarantine') loadQuarantine();
+  if (tab.dataset.tab === 'processes') loadProcesses();
+  if (tab.dataset.tab === 'startup') loadStartup();
   if (tab.dataset.tab === 'sigs') loadSigs();
   if (tab.dataset.tab === 'settings') loadSettings();
 }));
@@ -214,10 +216,16 @@ function renderResults(job) {
   box.innerHTML = `
     <div class="card-head">
       <h2>Wyniki (${interesting.length} do przejrzenia z ${results.length})</h2>
-      <label class="chip"><input type="checkbox" id="showClean"> pokaż czyste</label>
+      <div>
+        <a class="btn btn-ghost" id="btnReport" target="_blank">Raport HTML</a>
+        <label class="chip"><input type="checkbox" id="showClean"> pokaż czyste</label>
+      </div>
     </div>
     ${interesting.map(renderRow).join('') || '<p class="muted">Nie wykryto zagrożeń.</p>'}
     <div id="cleanRows" class="hidden">${clean.map(renderRow).join('')}</div>`;
+
+  const reportBtn = $('#btnReport');
+  if (reportBtn && job.id) reportBtn.href = `/api/report/${job.id}?fmt=html`;
 
   const toggle = $('#showClean');
   if (toggle) toggle.addEventListener('change', (e) => {
@@ -320,6 +328,146 @@ async function loadQuarantine() {
   }
 }
 $('#btnRefreshQuarantine').addEventListener('click', loadQuarantine);
+
+/* -------------------------------- procesy -------------------------------- */
+let procTimer = null;
+
+async function loadProcesses(refresh = false) {
+  const box = $('#procList');
+  try {
+    const res = await api(`/api/processes${refresh ? '?refresh=1' : ''}`);
+    if (res.state === 'running') {
+      box.innerHTML = '<p class="muted"><span class="spin">◌</span> Skanowanie procesów i ich plików wykonywalnych…</p>';
+      if (!procTimer) {
+        procTimer = setInterval(() => {
+          if (!document.querySelector('.tab[data-tab="processes"]').classList.contains('active')) {
+            clearInterval(procTimer); procTimer = null; return;
+          }
+          loadProcesses();
+        }, 3000);
+      }
+      if (res.data) renderProcesses(res.data, res.age_seconds);
+      return;
+    }
+    if (procTimer) { clearInterval(procTimer); procTimer = null; }
+    renderProcesses(res.data, res.age_seconds);
+  } catch (err) {
+    box.innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderProcesses(data, age) {
+  const box = $('#procList');
+  if (!data || data.error) {
+    box.innerHTML = `<p class="muted">${escapeHtml((data && data.error) || 'brak danych')}</p>`;
+    return;
+  }
+  const c = data.counts || {};
+  $('#procAge').textContent = `dane sprzed ${Math.round(age || 0)} s`;
+  $('#procSummary').innerHTML = `
+    <div class="card stat"><span class="label">Procesów</span><strong>${c.total || 0}</strong>
+      <span class="hint">przeskanowanych binarek: ${data.scanned_binaries || 0}</span></div>
+    <div class="card stat"><span class="label">Złośliwe</span><strong class="danger">${c.malicious || 0}</strong></div>
+    <div class="card stat"><span class="label">Podejrzane</span><strong style="color:var(--warn)">${c.suspicious || 0}</strong></div>`;
+
+  const rows = (data.threats && data.threats.length)
+    ? data.threats
+    : (data.processes || []).filter((p) => p.score > 0).slice(0, 40);
+
+  if (!rows.length) {
+    box.innerHTML = '<p class="muted">Nie wykryto podejrzanych procesów.</p>';
+    return;
+  }
+  box.innerHTML = rows.map((p) => `
+    <div class="res-row ${p.verdict}">
+      <div class="res-head">
+        <span><b>${escapeHtml(p.name)}</b> <span class="muted">pid=${p.pid}</span></span>
+        <span class="badge ${p.verdict}">${verdictPL(p.verdict)} · ${p.score} pkt</span>
+      </div>
+      <div class="muted" style="font-size:.78rem;margin-top:4px">
+        ${escapeHtml(p.exe || '(brak pliku wykonywalnego)')}
+        ${p.username ? ` · ${escapeHtml(p.username)}` : ''}
+        ${p.connections ? ` · ${p.connections} połączeń` : ''}
+      </div>
+      ${p.cmdline ? `<div class="muted" style="font-size:.76rem">$ ${escapeHtml(p.cmdline.slice(0, 160))}</div>` : ''}
+      ${(p.findings || []).map((f) => `
+        <div class="finding">
+          <span class="sev sev-${f.severity}">${f.severity}</span>
+          <span class="rule">${escapeHtml(f.rule)}</span> <span>+${f.weight}</span>
+          <div>${escapeHtml(f.description)}</div>
+        </div>`).join('')}
+    </div>`).join('');
+}
+$('#btnRefreshProc').addEventListener('click', () => loadProcesses(true));
+
+/* ------------------------------- autostart ------------------------------- */
+let startTimer = null;
+
+async function loadStartup(refresh = false) {
+  const box = $('#startList');
+  try {
+    const res = await api(`/api/startup${refresh ? '?refresh=1' : ''}`);
+    if (res.state === 'running') {
+      box.innerHTML = '<p class="muted"><span class="spin">◌</span> Audyt miejsc autostartu…</p>';
+      if (!startTimer) {
+        startTimer = setInterval(() => {
+          if (!document.querySelector('.tab[data-tab="startup"]').classList.contains('active')) {
+            clearInterval(startTimer); startTimer = null; return;
+          }
+          loadStartup();
+        }, 3000);
+      }
+      if (res.data) renderStartup(res.data, res.age_seconds);
+      return;
+    }
+    if (startTimer) { clearInterval(startTimer); startTimer = null; }
+    renderStartup(res.data, res.age_seconds);
+  } catch (err) {
+    box.innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderStartup(data, age) {
+  const box = $('#startList');
+  if (!data || data.error) {
+    box.innerHTML = `<p class="muted">${escapeHtml((data && data.error) || 'brak danych')}</p>`;
+    return;
+  }
+  const c = data.counts || {};
+  $('#startAge').textContent = `dane sprzed ${Math.round(age || 0)} s`;
+  $('#startSummary').innerHTML = `
+    <div class="card stat"><span class="label">Wpisów</span><strong>${c.total || 0}</strong></div>
+    <div class="card stat"><span class="label">Wysokie ryzyko</span><strong class="danger">${c.high_risk || 0}</strong></div>
+    <div class="card stat"><span class="label">Średnie ryzyko</span><strong style="color:var(--warn)">${c.medium_risk || 0}</strong></div>
+    <div class="card stat"><span class="label">Osierocone</span><strong>${c.missing_target || 0}</strong>
+      <span class="hint">wpis bez pliku</span></div>`;
+
+  const entries = (data.entries || []).filter((e) => e.score > 0);
+  if (!entries.length) {
+    box.innerHTML = '<p class="muted">Brak podejrzanych wpisów autostartu.</p>';
+    return;
+  }
+  box.innerHTML = entries.map((e) => `
+    <div class="res-row ${e.verdict}">
+      <div class="res-head">
+        <span><b>${escapeHtml(e.name)}</b></span>
+        <span class="badge ${e.verdict}">${escapeHtml(e.risk)} · ${e.score} pkt</span>
+      </div>
+      <div class="muted" style="font-size:.78rem;margin-top:4px">
+        ${escapeHtml(e.location)}
+      </div>
+      <div style="font-size:.82rem;margin-top:4px">${escapeHtml(e.command.slice(0, 200))}</div>
+      ${e.target ? `<div class="muted" style="font-size:.76rem">plik: ${escapeHtml(e.target)}
+        ${e.exists ? '' : '<b style="color:var(--danger)"> — NIE ISTNIEJE</b>'}</div>` : ''}
+      ${(e.findings || []).map((f) => `
+        <div class="finding">
+          <span class="sev sev-${f.severity}">${f.severity}</span>
+          <span class="rule">${escapeHtml(f.rule)}</span> <span>+${f.weight}</span>
+          <div>${escapeHtml(f.description)}</div>
+        </div>`).join('')}
+    </div>`).join('');
+}
+$('#btnRefreshStartup').addEventListener('click', () => loadStartup(true));
 
 /* -------------------------------- sygnatury ------------------------------ */
 async function loadSigs() {

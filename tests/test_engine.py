@@ -8,6 +8,7 @@ albo:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -273,6 +274,187 @@ class TestYaraClassification(unittest.TestCase):
             result = engine.scan_file(str(sample))
             self.assertEqual(result.verdict, Verdict.CLEAN.value,
                              f"fałszywy alarm: {[(f.rule, f.weight) for f in result.findings]}")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+class TestArchiveScanning(unittest.TestCase):
+    """Malware podróżuje w archiwach - skaner musi zaglądać do środka."""
+
+    def _engine(self, tmp):
+        engine = Engine(make_config(tmp))
+        engine.load(load_yara=False)
+        return engine
+
+    def _zip(self, members: dict) -> bytes:
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, data in members.items():
+                zf.writestr(name, data)
+        return buf.getvalue()
+
+    def test_eicar_inside_zip_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            payload = self._zip({"faktura.pdf.exe": EICAR.encode()})
+            result = engine.scan_bytes("/tmp/faktura.zip", payload)
+            self.assertEqual(result.verdict, Verdict.MALICIOUS.value)
+            self.assertTrue(any(f.rule == "nested_threat" for f in result.findings))
+
+    def test_clean_zip_stays_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            payload = self._zip({"notatka.txt": "Spotkanie o 10:00 w pokoju 214."})
+            result = engine.scan_bytes("/tmp/czyste.zip", payload)
+            self.assertEqual(result.verdict, Verdict.CLEAN.value,
+                             f"fałszywy alarm: {[f.rule for f in result.findings]}")
+
+    def test_path_traversal_is_flagged(self):
+        from avengine.archives import ArchiveScanner
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            payload = self._zip({"../../../../etc/evil.sh": "rm -rf /"})
+            scanner = ArchiveScanner(engine)
+            findings, _report = scanner.scan("/tmp/z.zip", payload, "zip")
+            self.assertTrue(any(f.rule == "path_traversal" for f in findings))
+
+    def test_zip_bomb_is_refused(self):
+        """1 MB archiwum nie może rozpakować się do gigabajtów."""
+        from avengine.archives import ArchiveScanner
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            import io
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("bomb.bin", b"\x00" * (80 * 1024 * 1024))   # 80 MB zer
+            compressed = buf.getvalue()
+            self.assertLess(len(compressed), 1024 * 1024)
+
+            scanner = ArchiveScanner(engine)
+            scanner.max_ratio = 100
+            findings, report = scanner.scan("/tmp/bomb.zip", compressed, "zip")
+            notes = " ".join(report.notes)
+            self.assertIn("bomb", notes.lower())
+            self.assertFalse(report.threats)
+
+    def test_encrypted_archive_is_reported_as_unverified(self):
+        """Zaszyfrowane archiwum to „nieprzebadane", nie „czyste"."""
+        py7zr = pytest_import("py7zr")
+        if py7zr is None:
+            self.skipTest("brak py7zr")
+        from avengine.archives import ArchiveScanner
+        import io
+
+        buf = io.BytesIO()
+        with py7zr.SevenZipFile(buf, "w", password="haslo") as archive:
+            archive.writeall(str(REPO / "samples" / "clean" / "notatka.txt"), "notatka.txt")
+        payload = buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            scanner = ArchiveScanner(engine)
+            findings, report = scanner.scan("/tmp/x.7z", payload, "7z")
+            flagged = (
+                any(f.rule in ("encrypted_archive", "unscannable") for f in findings)
+                or any("zaszyfrowan" in note.lower() for note in report.notes))
+            self.assertTrue(flagged,
+                            f"findings={[f.rule for f in findings]} notes={report.notes}")
+            self.assertFalse(report.threats, "nieprzebadane != czyste, ale i nie=złośliwe")
+
+
+def pytest_import(name):
+    try:
+        return __import__(name)
+    except ImportError:
+        return None
+
+
+class TestProcessAndStartupHelpers(unittest.TestCase):
+    """Testy funkcji pomocniczych (pełny skan procesów jest testem integracyjnym)."""
+
+    def test_system_dir_detection(self):
+        from avengine.processes import _in_system_dir, _in_temp_dir
+        self.assertTrue(_in_system_dir("/usr/bin/sshd"))
+        self.assertTrue(_in_system_dir("c:\\windows\\system32\\svchost.exe"))
+        self.assertTrue(_in_temp_dir("/tmp/aktualizacja.exe"))
+        self.assertTrue(_in_temp_dir("c:\\users\\a\\appdata\\local\\temp\\x.exe"))
+        self.assertFalse(_in_temp_dir("/usr/bin/ls"))
+
+    def test_startup_target_extraction(self):
+        from avengine.startup_audit import _extract_target
+        self.assertEqual(_extract_target("/usr/bin/backup.sh --daily"), "/usr/bin/backup.sh")
+        self.assertEqual(_extract_target('"/opt/app/run.sh" -v'), "/opt/app/run.sh")
+        self.assertEqual(_extract_target("bash -c '/tmp/x.sh'"), "/tmp/x.sh")
+        self.assertEqual(_extract_target("https://evil.example/x.sh"), "")
+        self.assertEqual(_extract_target(""), "")
+
+    def test_process_scanner_reports_structure(self):
+        from avengine.processes import ProcessScanner
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine(make_config(tmp))
+            engine.load(load_yara=False)
+            report = ProcessScanner(engine).scan(include_connections=False)
+            self.assertIn("counts", report)
+            self.assertIn("processes", report)
+            self.assertGreater(report["counts"]["total"], 0)
+            # Wątki jądra nie mogą być raportowane jako malware.
+            self.assertEqual(report["counts"]["malicious"], 0,
+                             "fałszywy alarm na procesach systemowych")
+
+    def test_startup_audit_returns_entries(self):
+        from avengine.startup_audit import StartupAuditor
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine(make_config(tmp))
+            engine.load(load_yara=False)
+            report = StartupAuditor(engine).audit()
+            self.assertIn("entries", report)
+            self.assertIn("counts", report)
+            self.assertGreater(report["counts"]["total"], 0)
+
+
+class TestReports(unittest.TestCase):
+    def test_html_report_contains_verdicts(self):
+        from avengine.report import render_html, render_json, write_report
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine(make_config(tmp))
+            engine.load(load_yara=False)
+            summary = engine.scan_paths([str(REPO / "samples")], workers=4)
+            html_text = render_html(summary, {"version": "test", "hostname": "testhost"})
+            self.assertIn("ZŁOŚLIWY", html_text)
+            self.assertIn("eicar.com", html_text)
+            self.assertIn("Raport skanu", html_text)
+
+            payload = json.loads(render_json(summary))
+            self.assertIn("results", payload)
+            self.assertGreater(payload["summary"]["malicious"], 0)
+
+            out = Path(tmp) / "raport.html"
+            write_report(summary, str(out), fmt="html")
+            self.assertTrue(out.exists())
+
+
+class TestYaraSuppression(unittest.TestCase):
+    def test_packaged_suppression_list_is_loaded(self):
+        """Reguły z listy tłumień nie mogą punktować."""
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine(make_config(tmp))
+            engine.load(load_yara=False)
+            engine.store.yara.load_suppressions()
+            self.assertIn("PoetRat_Python", engine.store.yara.suppressed_rules)
+
+    def test_canary_rules_are_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine(make_config(tmp))
+            cfg = Config()
+            engine.store.yara.load_directory(cfg.yara_dir)
+            # Reguła "domain" pasuje do danych losowych - musi zostać odrzucona.
+            if engine.store.yara.rules or engine.store.yara.info_rules:
+                self.assertIn("domain", engine.store.yara.noisy_rules)
 
 
 if __name__ == "__main__":

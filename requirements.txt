@@ -12,6 +12,10 @@ aiofiles>=23.2
 # Monitoring w czasie rzeczywistym
 watchdog>=4.0
 
-# Opcjonalnie (silnik działa bez nich, degrade gracefully):
+# Skany dodatkowe
 psutil>=5.9             # skanowanie procesów (Windows/Linux)
+py7zr>=1.0              # archiwa 7z
+
+# Opcjonalnie (silnik działa bez nich, degrade gracefully):
+rarfile>=4.0            # archiwa RAR (wymaga też zewnętrznego unrar/bsdtar)
 py-tlsh>=4.7            # TLSH - alternatywny fuzzy hash; jeśli niedostępny używamy ssdeep

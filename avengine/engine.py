@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 
 from .config import Config
+from .detectors.archive import ArchiveDetector
 from .detectors.base import Detector, ScanContext
 from .detectors.clamav_sig import ClamAVDetector
 from .detectors.packer import PackerDetector
@@ -50,6 +51,7 @@ class Engine:
             PEHeuristicsDetector(),
             PackerDetector(),
             ScriptHeuristicsDetector(),
+            ArchiveDetector(),
         ]
         self.loaded = False
 
@@ -91,7 +93,7 @@ class Engine:
         return self.scan_bytes(path, data, started=started, result=result)
 
     def scan_bytes(self, path: str, data: bytes, started: Optional[float] = None,
-                   result: Optional[ScanResult] = None) -> ScanResult:
+                   result: Optional[ScanResult] = None, depth: int = 0) -> ScanResult:
         started = started if started is not None else time.perf_counter()
         result = result or ScanResult(path=path)
         result.size = len(data)
@@ -99,7 +101,10 @@ class Engine:
         result.file_type = detect(data, path)
         hashes = bytes_hashes(data)
         result.md5, result.sha1, result.sha256 = hashes["md5"], hashes["sha1"], hashes["sha256"]
-        result.ssdeep = ssdeep_hash(data) if len(data) >= 4096 else ""
+        # ssdeep jest kosztowny (czysty Python) i przydatny tylko wtedy, gdy
+        # mamy w bazie hasze fuzzy do porównania - inaczej liczymy go na próżno.
+        if self.store.fuzzy and 4096 <= len(data) <= self.config.max_fuzzy_size:
+            result.ssdeep = ssdeep_hash(data)
 
         pe = None
         pe_error = None
@@ -120,6 +125,10 @@ class Engine:
             path=path, data=data, file_type=result.file_type, result=result,
             config=self.config, store=self.store, pe=pe, pe_error=pe_error,
         )
+        # Detektory mogą potrzebować silnika (np. do skanowania elementów
+        # archiwum) i informacji o głębokości rekurencji.
+        ctx.cache["engine"] = self
+        ctx.cache["depth"] = depth
 
         for detector in self.detectors:
             try:

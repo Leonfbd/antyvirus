@@ -46,6 +46,9 @@ Sześć warstw. Każda dokłada punkty do wspólnego wyniku ryzyka (0–100):
 | 4 | **Heurystyka PE** | struktura plików wykonywalnych Windows | 3–35 |
 | 5 | **Entropia** | pakowanie, kryptory, kompresja | 8–25 |
 | 6 | **Skrypty i makra** | PowerShell / JS / VBS / BAT / makra Office | 8–45 |
+| 7 | **Archiwa** | rozpakowanie ZIP/TAR/7z/RAR/gzip/xz i skan zawartości | 8–100 |
+| — | **Procesy** | obrazy uruchomionych procesów, podszywanie, katalog tymczasowy | 5–50 |
+| — | **Autostart** | klucze Run, usługi, harmonogram, cron, systemd, profile powłoki | 15–50 |
 
 **Werdykt:** `≥25 pkt` → podejrzany, `≥60 pkt` → złośliwy. Pojedyncze trafienie
 krytyczne (znany hasz, sygnatura malware) daje od razu „złośliwy”, nawet gdy suma
@@ -63,6 +66,35 @@ Short-circuit: po trafieniu wartym 100 pkt pozostałe warstwy są pomijane — n
 sensu analizować pliku, który już został rozpoznany.
 
 ---
+
+## Kontrola jakości reguł: test kanarkowy i lista tłumień
+
+Publiczne bazy reguł są darmowe i utrzymywane przez społeczność, więc trafiają
+się w nich reguły zepsute. Najlepszy znaleziony przykład:
+
+```yara
+$commands         = /version|ls|cd|sysinfo|download|upload|shot|.../   // "version" ma każdy plik
+$grammer_massacre = /BADD|Bad Error Happened|/                          // pusta gałąź "|" = pasuje WSZĘDZIE
+condition: 3 of them
+```
+
+Końcowe `|` tworzy pustą alternatywę, która dopasowuje się do pustego ciągu —
+czyli do każdego pliku. W parze z jednym trafieniem słowa „Affine" (obecnego
+w bibliotekach kryptograficznych Go) reguła flagowała m.in. `/usr/bin/envd`
+i `/usr/bin/sshd`.
+
+Silnik broni się przed tym dwustopniowo, dokładnie tak jak komercyjne AV
+(testowanie sygnatur na korpusie czystych plików + ręczne listy wyłączeń):
+
+1. **Test kanarkowy (automatyczny).** Po załadowaniu każda reguła jest
+   uruchamiana na zestawie próbek, na których poprawna reguła nie ma prawa
+   zadziałać: dane losowe, zera, tekst z pospolitymi słowami oraz fragmenty
+   prawdziwych binarek systemowych. Reguła, która się dopasuje, zostaje
+   wyłączona z punktacji (0 pkt, widoczna jako adnotacja). Obecnie odpada
+   7 reguł, w tym `domain`, `IP`, `contains_base64`, `url`.
+2. **Lista tłumień (ręczna).** `avengine/sigs/suppressed_rules.txt` na
+   przypadki, których automat nie wychwyci — każdy wpis ma opisany powód.
+   Własne wpisy możesz trzymać w `data/sigs/suppressed_rules.txt`.
 
 ## Dlaczego reguły YARA są klasyfikowane (najważniejsza decyzja projektowa)
 
@@ -107,6 +139,32 @@ podnoszenie uprawnień, wyliczanie procesów.
 **Entropia** — cały plik, per sekcja, w oknach (wykrywa zaszyfrowany blok wewnątrz
 dużego pliku) oraz test kompresowalności (dane zaszyfrowane nie kompresują się).
 
+**Archiwa** — zawartość rozpakowywana jest w pamięci (lub, dla 7z/RAR, przez
+katalog tymczasowy) i skanowana wszystkimi warstwami, z zagnieżdżeniem do 3
+poziomów. Wykrywany jest **path traversal** (`../../etc/evil.sh`), **bomba zip**
+(współczynnik kompresji sprawdzany *przed* rozpakowaniem), **zaszyfrowane
+archiwa** (werdykt: nieprzebadane, nie „czyste") oraz pliki wykonywalne
+ukryte pod podwójnym rozszerzeniem (`faktura.pdf.exe`).
+
+**Procesy** — każdy uruchomiony proces jest weryfikowany: z jakiego pliku
+wystartował, czy ten plik istnieje (malware kasuje swój dropper), czy nie
+podszywa się pod proces systemowy (`svchost.exe` z `%TEMP%`), czy startuje
+z katalogu tymczasowego, czy dostał zakodowane polecenie (`powershell -enc`)
+i czy utrzymuje połączenia sieciowe. Wątki jądra nie są traktowane jako
+zagrożenie (to osobna, częsta pułapka).
+
+**Autostart** — wyliczane są wszystkie miejsca, z których system uruchamia kod
+bez pytania, wraz z oceną tego, co z nich wystartuje: **osierocone wpisy**
+(wskazujące na nieistniejący plik), uruchamianie z katalogów zapisywalnych
+przez użytkownika, podszywanie się pod procesy systemowe oraz podejrzane
+polecenia (`certutil`, `curl | sh`, `powershell -enc`).
+
+Windows: klucze Run/RunOnce (HKCU i HKLM), Winlogon, usługi (ImagePath),
+foldery Startup, zadania harmonogramu.
+Linux: `~/.config/autostart`, `/etc/xdg/autostart`, crontab, jednostki
+systemd (użytkownika i systemowe), `/etc/init.d`, `/etc/rc.local`,
+profile powłoki.
+
 **Skrypty** — PowerShell (`-enc`, `Invoke-Expression`, `DownloadString`, bypass AMSI,
 wyłączanie Defendera, `Invoke-Mimikatz`), BAT (`certutil`, `bitsadmin`, usuwanie
 kopii w tle, `bcdedit`, wyłączanie AV), JS/VBS (ActiveX, `eval`, `unescape`),
@@ -149,6 +207,9 @@ Wymagania: Python ≥ 3.9, `git` (do aktualizacji baz). Działa na Linuksie i Wi
 ./avy quarantine list               # kwarantanna
 ./avy quarantine restore <id>       # przywróć plik
 ./avy ioc add podejrzany.exe Nazwa  # dodaj własny wskaźnik
+./avy processes                     # skan uruchomionych procesów
+./avy startup                       # audyt miejsc autostartu
+./avy report ~/Pobrane -o raport.html   # skan + raport HTML (lub --format json/txt)
 ./avy serve --port 8080             # panel WWW
 ```
 
@@ -228,15 +289,24 @@ Zmierzone na ~1 300 plikach reguł YARA:
 
 | Operacja | Wynik |
 |---|---|
-| Ładowanie sygnatur | ~6 s, **129 MB** RSS |
+| Ładowanie sygnatur | ~7 s, **129 MB** RSS |
 | YARA na plik | ~12 ms (4 obiekty reguł zamiast 1 300) |
+| Mały plik PE (3 KB), pełny skan | ~13 ms |
+| Duży plik (12,8 MB), pełny skan | **6,8 s** (było 24 s) |
 | Skan katalogu | równolegle, wątki (domyślnie 8) |
 
-Kluczowa optymalizacja: reguły kompilowane są **wsadowo** do czterech obiektów
-(po walidacji każdego pliku z osobna), a nie każdy plik do osobnego obiektu.
-To samo dało spadek pamięci z 734 MB do 129 MB i 3× szybsze dopasowanie.
-Dodatkowo: short-circuit po trafieniu decydującym, prefiltr po prefiksach bajtowych
-w sygnaturach ClamAV, strumieniowe haszowanie dużych plików.
+Kluczowe optymalizacje:
+
+* Reguły YARA kompilowane **wsadowo** — 4 obiekty zamiast 1 300 (pamięć
+  734 MB → 129 MB, 3× szybsze dopasowanie).
+* Reguły **informacyjne** (0 pkt) pomijane na plikach > 1 MB — to one są
+  najdroższe, bo pasują do wszystkiego.
+* **ssdeep** (czysty Python, ~11 s dla 12 MB) liczony tylko wtedy, gdy baza
+  ma hasze fuzzy do porównania.
+* **Entropia z próbki** dla plików > 4 MB (wynik statystycznie identyczny,
+  koszt ~20× mniejszy).
+* Short-circuit po trafieniu decydującym, prefiltr po prefiksach bajtowych
+  w sygnaturach ClamAV, strumieniowe haszowanie dużych plików.
 
 ---
 
@@ -246,10 +316,13 @@ w sygnaturach ClamAV, strumieniowe haszowanie dużych plików.
 python3 -m unittest discover -s tests -v
 ```
 
-24 testy: parser sygnatur ClamAV (składnia, wildcardy, dopasowanie), entropia,
-werdykty dla próbek, kwarantanna (przeniesienie + przywrócenie), rozpoznawanie typów,
-**klasyfikacja reguł YARA** (reguły informacyjne nie punktują) oraz test
-„czysty plik PE pozostaje czysty” przy załadowanych pełnych bazach społecznościowych.
+36 testów: parser sygnatur ClamAV (składnia, wildcardy, dopasowanie),
+**archiwa** (EICAR w ZIP, czysty ZIP zostaje czysty, path traversal, bomba zip,
+zaszyfrowane 7z), entropia, werdykty dla próbek, kwarantanna, rozpoznawanie
+typów, raporty HTML/JSON, **klasyfikacja reguł YARA** (reguły informacyjne nie
+punktują, lista tłumień jest ładowana, reguły kanarkowe są odrzucane) oraz test
+„czysty plik PE pozostaje czysty” przy załadowanych pełnych bazach
+społecznościowych.
 
 `tools/make_samples.py` tworzy nieaktywne pliki testowe (EICAR, syntetyczny PE z
 cechami packera, skrypt droppujący, skrypt ransomware). Nie uruchamiaj ich —
@@ -273,6 +346,7 @@ avengine/
 │   ├── packer.py          # 5. entropia
 │   └── script_heuristics.py  # 6. skrypty i makra
 ├── sigs/  store.py  clamav.py  updater.py
+├── processes.py  startup_audit.py  archives.py  report.py
 ├── cli.py                 # `avy`
 └── web/  app.py  static/
 tools/make_samples.py  tests/  samples/
@@ -283,8 +357,10 @@ tools/make_samples.py  tests/  samples/
 * Brak analizy behawioralnej (silnik nie uruchamia plików w piaskownicy).
 * Brak heurystyki pamięci/procesów i sterownika kernelowego (to wymaga uprawnień
   SYSTEM i podpisanych sterowników).
-* Brak odpakowywania archiwów (`scan_archives` jest w konfiguracji, ale warstwa
-  jeszcze nie zagląda do środka ZIP/RAR).
+* Archiwa RAR wymagają zewnętrznego narzędzia (`unrar`/`bsdtar`) — bez niego
+  zawartość RAR pozostaje nieprzebadana.
+* Procesy są oceniane po ich obrazie na dysku, nie po zawartości pamięci
+  (do analizy pamięci potrzebny jest sterownik kernelowy).
 * Bazy społecznościowe są darmowe, więc też widoczne dla autorów malware —
   wykrywają to, co już znane.
 

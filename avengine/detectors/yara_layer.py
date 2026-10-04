@@ -21,7 +21,11 @@ z którego pochodzi (wyciąganej podczas ładowania).
 from __future__ import annotations
 
 import logging
+import os
+import random
 import re
+import sys
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -114,12 +118,17 @@ class YaraDetector(Detector):
     description = "Dopasowanie reguł YARA (bazy społecznościowe + własne)"
 
     def __init__(self) -> None:
-        self.rules: List[Tuple[str, "yara.Rules"]] = []
+        self.rules: List[Tuple[str, "yara.Rules"]] = []        # decydujące (zawsze)
+        self.info_rules: List[Tuple[str, "yara.Rules"]] = []   # tylko informacyjne
+        self.file_categories: Dict[str, set] = {}
         self.rule_count = 0
         self.errors: List[str] = []
         self.loaded = False
         self.rule_category: Dict[str, str] = {}   # nazwa reguły -> kategoria
         self.category_counts: Dict[str, int] = {}
+        self.noisy_rules: set = set()             # reguły odrzucone testem kanarkowym
+        self.suppressed_rules: set = set()        # reguły wyłączone ręcznie (lista tłumień)
+        self.canary_count = 0
 
     # --- ładowanie ---
     def load_directory(self, directory: Path, chunk: int = 400) -> int:
@@ -147,9 +156,11 @@ class YaraDetector(Detector):
             return 0
 
         self.rules = []
+        self.info_rules = []
         self.errors = []
         self.rule_count = 0
         self.rule_category = {}
+        self.file_categories = {}
 
         files = sorted(
             p for p in directory.rglob("*")
@@ -168,28 +179,48 @@ class YaraDetector(Detector):
             good.append(path)
             self._register_rule_names(path, directory)
 
-        # --- faza 2: kompilacja wsadowa ---
-        for start in range(0, len(good), chunk):
-            batch = good[start:start + chunk]
-            mapping = {}
-            for idx, path in enumerate(batch):
-                namespace = _safe_namespace(path, directory)
-                while namespace in mapping:
-                    namespace = f"{namespace}_{idx}"
-                mapping[namespace] = str(path)
-            try:
-                compiled = yara.compile(filepaths=mapping, externals=EXTERNALS)
-                self.rules.append((f"batch{len(self.rules)}", compiled))
-                self.rule_count += len(batch)
-            except Exception as exc:  # nie powinno się zdarzyć po walidacji
-                self.errors.append(f"wsad {start}: {str(exc).splitlines()[0][:160]}")
+        # --- faza 2: kompilacja wsadowa, osobno dla reguł decydujących
+        #     i informacyjnych ---
+        # Reguły informacyjne (IsPE32, contains_base64, domain…) dają 0 punktów,
+        # a są najdroższe w dopasowaniu, bo pasują do wszystkiego. Trzymamy je
+        # osobno, żeby na dużych plikach można je było pominąć.
+        decisive = [p for p in good
+                    if self.file_categories.get(str(p), {UNKNOWN}) - {INFO}]
+        info_only = [p for p in good if p not in set(decisive)]
+
+        self.rules = self._compile_group(decisive, directory, chunk, "dec")
+        self.info_rules = self._compile_group(info_only, directory, chunk, "info")
+        self.rule_count = len(decisive) + len(info_only)
 
         self.category_counts = {}
         for category in self.rule_category.values():
             self.category_counts[category] = self.category_counts.get(category, 0) + 1
 
+        # Reguły, które dopasowują się do wszystkiego, wyłączamy z punktacji.
+        self.load_suppressions()
+        self.detect_noisy_rules()
+
         self.loaded = bool(self.rules)
         return self.rule_count
+
+    def _compile_group(self, files: "list[Path]", root: Path, chunk: int,
+                       prefix: str) -> "list[Tuple[str, yara.Rules]]":
+        compiled_group = []
+        for start in range(0, len(files), chunk):
+            batch = files[start:start + chunk]
+            mapping = {}
+            for idx, path in enumerate(batch):
+                namespace = _safe_namespace(path, root)
+                while namespace in mapping:
+                    namespace = f"{namespace}_{idx}"
+                mapping[namespace] = str(path)
+            try:
+                compiled_group.append(
+                    (f"{prefix}{len(compiled_group)}",
+                     yara.compile(filepaths=mapping, externals=EXTERNALS)))
+            except Exception as exc:  # nie powinno się zdarzyć po walidacji
+                self.errors.append(f"wsad {prefix}{start}: {str(exc).splitlines()[0][:160]}")
+        return compiled_group
 
     def _register_rule_names(self, path: Path, root: Path) -> None:
         """Wyciąga nazwy reguł z pliku i przypisuje im kategorię."""
@@ -201,8 +232,12 @@ class YaraDetector(Detector):
             text = path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             return
+        categories = set()
         for name in RE_RULE_NAME.findall(text):
-            self.rule_category[name] = classify_rule(rel, name)
+            category = classify_rule(rel, name)
+            self.rule_category[name] = category
+            categories.add(category)
+        self.file_categories[str(path)] = categories or {UNKNOWN}
 
     def add_inline(self, name: str, source: str) -> bool:
         if yara is None:
@@ -218,19 +253,117 @@ class YaraDetector(Detector):
             self.errors.append(f"{name}: {exc}")
             return False
 
+    # --- test kanarkowy (odrzucanie reguł generujących fałszywe alarmy) ---
+    def _build_canaries(self) -> List[bytes]:
+        """Zestaw próbek, na których POPRAWNA reguła nie ma prawa zadziałać.
+
+        Publiczne bazy reguł zawierają reguły zepsute. Klasyczny przykład:
+        `/BADD|Bad Error Happened|/` - pusta gałąź alternatywy pasuje do
+        pustego ciągu, więc wzorzec dopasowuje się do KAŻDEGO pliku; w parze
+        z `/version|ls|cd|.../` daje regułę, która flaguje niemal wszystko.
+
+        Zamiast ręcznie utrzymywać czarną listę, sprawdzamy reguły empirycznie:
+        ta, która dopasuje się do danych kanarkowych, jest zbyt ogólna, by
+        mogła wnosić cokolwiek do decyzji.
+        """
+        canaries: List[bytes] = []
+
+        rnd = random.Random(20240101)             # deterministycznie, by wyniki były powtarzalne
+        canaries.append(bytes(rnd.getrandbits(8) for _ in range(65536)))
+        canaries.append(b"\x00" * 65536)
+
+        words = ("version ls cd exit download upload tasklist taskkill register "
+                 "compress jobs shot hid link mv cp sysinfo the and that this "
+                 "with from your have which one would there their").split()
+        text = " ".join(words * 400)
+        canaries.append(text.encode()[:65536])
+
+        # Prawdziwe pliki wykonywalne systemowe - najlepszy test na reguły,
+        # które dopasowują się do czegokolwiek binarnego. Bierzemy kilka,
+        # bo reguła bywa zbyt ogólna tylko dla konkretnego typu binarki
+        # (np. statycznie linkowany Go z kryptografią).
+        candidates = [sys.executable, "/usr/bin/envd", "/bin/ls", "/bin/bash",
+                      "/usr/bin/git", "/usr/bin/sshd", "/usr/bin/python3"]
+        taken = 0
+        for candidate in candidates:
+            if taken >= 4:
+                break
+            try:
+                if candidate and os.path.isfile(candidate):
+                    with open(candidate, "rb") as fh:
+                        canaries.append(fh.read(1 << 19))   # pierwsze 512 kB
+                    taken += 1
+            except Exception:
+                continue
+        return canaries
+
+    def load_suppressions(self, extra_path: "Optional[Path]" = None) -> int:
+        """Wczytuje ręczną listę tłumień (reguły wyłączone z punktacji)."""
+        self.suppressed_rules = set()
+        candidates = [
+            Path(__file__).resolve().parent.parent / "sigs" / "suppressed_rules.txt",
+            extra_path,
+        ]
+        for path in candidates:
+            if path is None or not Path(path).exists():
+                continue
+            try:
+                for line in Path(path).read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        self.suppressed_rules.add(line)
+            except Exception:
+                continue
+        return len(self.suppressed_rules)
+
+    def detect_noisy_rules(self) -> int:
+        """Oznacza reguły dopasowujące się do danych kanarkowych."""
+        self.noisy_rules = set()
+        canaries = self._build_canaries()
+        self.canary_count = len(canaries)
+        all_rules = list(self.rules) + list(self.info_rules)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _namespace, rules in all_rules:
+                for canary in canaries:
+                    try:
+                        for m in rules.match(data=canary, timeout=60):
+                            self.noisy_rules.add(m.rule)
+                    except Exception:
+                        continue
+        log.info("Test kanarkowy odrzucił %d reguł (zbyt ogólne)", len(self.noisy_rules))
+        return len(self.noisy_rules)
+
     # --- skanowanie ---
     def applies_to(self, ctx: ScanContext) -> bool:
         return self.loaded and bool(ctx.data)
 
+    def _rules_for(self, ctx: ScanContext):
+        """Które obiekty reguł uruchomić dla tego pliku.
+
+        Reguły czysto informacyjne pomijamy na dużych plikach - dają 0 punktów,
+        a potrafią zdominować czas skanu (zmierzone: ~40% czasu YARY na 12 MB).
+        """
+        if not self.info_rules:
+            return self.rules
+        limit = getattr(ctx.config, "yara_info_max_size", 1024 * 1024)
+        if len(ctx.data) <= limit:
+            return list(self.rules) + list(self.info_rules)
+        return self.rules
+
     def run(self, ctx: ScanContext) -> List:
         """Dopasowuje reguły, klasyfikuje trafienia i dolicza punkty z limitem."""
-        if not self.rules:
+        if not self.rules and not self.info_rules:
             return ctx.result.findings
 
         matches: Dict[str, dict] = {}
-        for namespace, rules in self.rules:
+        for namespace, rules in self._rules_for(ctx):
             try:
-                yara_matches = rules.match(data=ctx.data, timeout=60)
+                # libyara potrafi rzucać RuntimeWarning "too many matches for
+                # string" - to tylko szum diagnostyczny, nie błąd skanowania.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    yara_matches = rules.match(data=ctx.data, timeout=60)
             except Exception as exc:
                 log.debug("yara match error on %s: %s", ctx.path, exc)
                 continue
@@ -252,6 +385,18 @@ class YaraDetector(Detector):
         scored: List[Tuple[int, str, str, str, str, Optional[str]]] = []
         for hit in hits:
             meta = hit["meta"]
+            if hit["rule"] in self.suppressed_rules:
+                ctx.add(self.name, f"suppressed.{hit['rule']}", Severity.INFO.value,
+                        f"Reguła na liście tłumień (znany fałszywy alarm): {hit['rule']}",
+                        weight=0, evidence="zobacz avengine/sigs/suppressed_rules.txt")
+                continue
+            if hit["rule"] in self.noisy_rules:
+                # Reguła dopasowuje się do danych kanarkowych - nie wnosi nic
+                # do decyzji, a produkuje fałszywe alarmy na każdym pliku.
+                ctx.add(self.name, f"noisy.{hit['rule']}", Severity.INFO.value,
+                        f"Reguła odrzucona testem kanarkowym (zbyt ogólna): {hit['rule']}",
+                        weight=0, evidence="dopasowuje się do danych losowych/zerowych")
+                continue
             category = meta_category(meta) or self.rule_category.get(hit["rule"], UNKNOWN)
             weight = CATEGORY_WEIGHT[category]
             severity = CATEGORY_SEVERITY[category]
