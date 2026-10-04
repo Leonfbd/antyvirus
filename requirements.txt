@@ -1,0 +1,17 @@
+# Rdzeń silnika
+yara-python>=4.5.0      # silnik YARA (wheel zawiera wbudowany libyara wraz z modułem "pe")
+pefile>=2023.2.7        # parser struktury PE/PE32+
+ppdeep>=2020.0.0        # czysto-pythonowy ssdeep (fuzzy hashing) - bez kompilacji
+
+# Interfejs WWW + API
+fastapi>=0.110
+uvicorn[standard]>=0.27
+jinja2>=3.1
+aiofiles>=23.2
+
+# Monitoring w czasie rzeczywistym
+watchdog>=4.0
+
+# Opcjonalnie (silnik działa bez nich, degrade gracefully):
+psutil>=5.9             # skanowanie procesów (Windows/Linux)
+py-tlsh>=4.7            # TLSH - alternatywny fuzzy hash; jeśli niedostępny używamy ssdeep

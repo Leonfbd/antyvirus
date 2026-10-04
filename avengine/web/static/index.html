@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AntyVirus — panel ochrony</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🛡️</text></svg>">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="shield">🛡️</span>
+    <div>
+      <h1>AntyVirus</h1>
+      <p class="sub">wielowarstwowy silnik detekcji</p>
+    </div>
+  </div>
+  <div class="status-area">
+    <span id="protectionPill" class="pill pill-off">OCHRONA NIEAKTYWNA</span>
+    <button id="toggleProtection" class="btn btn-primary">Włącz ochronę</button>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="dashboard">Pulpit</button>
+  <button class="tab" data-tab="scan">Skanowanie</button>
+  <button class="tab" data-tab="threats">Wykrycia</button>
+  <button class="tab" data-tab="quarantine">Kwarantanna</button>
+  <button class="tab" data-tab="sigs">Sygnatury</button>
+  <button class="tab" data-tab="settings">Ustawienia</button>
+</nav>
+
+<main>
+  <!-- ============================ PULPIT ============================ -->
+  <section id="dashboard" class="tab-panel active">
+    <div class="cards">
+      <div class="card stat">
+        <span class="label">Stan ochrony</span>
+        <strong id="statProtection">—</strong>
+        <span class="hint" id="statWatched">brak obserwowanych katalogów</span>
+      </div>
+      <div class="card stat">
+        <span class="label">Sygnatury</span>
+        <strong id="statSigs">—</strong>
+        <span class="hint" id="statSigsHint">ładowanie…</span>
+      </div>
+      <div class="card stat">
+        <span class="label">Wykryte zagrożenia</span>
+        <strong id="statThreats" class="danger">—</strong>
+        <span class="hint" id="statThreatsHint">łącznie w historii</span>
+      </div>
+      <div class="card stat">
+        <span class="label">W kwarantannie</span>
+        <strong id="statQuarantine">—</strong>
+        <span class="hint">pliki odizolowane</span>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h2>Szybkie akcje</h2>
+        <div class="actions">
+          <button class="btn" data-quick="home">Skanuj katalog domowy</button>
+          <button class="btn" data-quick="downloads">Skanuj Pobrane</button>
+          <button class="btn" data-quick="samples">Skanuj przykłady (samples/)</button>
+          <button class="btn btn-ghost" id="btnUpdateSigs">Aktualizuj sygnatury</button>
+        </div>
+        <p class="note" id="quickNote"></p>
+      </div>
+
+      <div class="card">
+        <h2>Warstwy silnika</h2>
+        <ul class="layers" id="layerList">
+          <li><b>1.</b> Reputacja haszowa (md5/sha1/sha256)</li>
+          <li><b>2.</b> Sygnatury ClamAV (.hdb/.hsb/.ndb)</li>
+          <li><b>3.</b> Reguły YARA (+ moduł PE)</li>
+          <li><b>4.</b> Heurystyka strukturalna PE</li>
+          <li><b>5.</b> Entropia / wykrywanie pakowania</li>
+          <li><b>6.</b> Heurystyka skryptów i makr</li>
+        </ul>
+        <p class="note">Wynik to suma punktów: ≥<b id="thrSusp">25</b> podejrzany,
+           ≥<b id="thrMal">60</b> złośliwy. Pojedyncze trafienie krytyczne daje
+           werdykt „złośliwy” natychmiast.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Ostatnie zdarzenia</h2>
+      <div id="eventFeed" class="feed"><p class="muted">Brak zdarzeń.</p></div>
+    </div>
+  </section>
+
+  <!-- ========================== SKANOWANIE ========================== -->
+  <section id="scan" class="tab-panel">
+    <div class="card">
+      <h2>Skanowanie na żądanie</h2>
+      <div class="scan-form">
+        <input type="text" id="scanPath" placeholder="/ścieżka/do/katalogu lub pliku">
+        <button class="btn" id="btnBrowse">Przeglądaj</button>
+        <button class="btn btn-primary" id="btnScan">Skanuj</button>
+      </div>
+      <label class="chip" style="margin-top:12px">
+        <input type="checkbox" id="scanQuarantine"> izoluj wykryte zagrożenia
+      </label>
+      <div id="browseList" class="browse hidden"></div>
+
+      <div id="scanProgressWrap" class="progress-wrap hidden">
+        <div class="progress"><div id="scanBar" class="bar"></div></div>
+        <div class="progress-meta">
+          <span id="scanStatus">Przygotowanie…</span>
+          <span id="scanCounts" class="muted"></span>
+        </div>
+      </div>
+
+      <div id="scanResults" class="results hidden"></div>
+    </div>
+  </section>
+
+  <!-- ========================== WYKRYCIA ============================ -->
+  <section id="threats" class="tab-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>Historia wykryć</h2>
+        <div class="filters">
+          <button class="chip active" data-filter="">Wszystkie</button>
+          <button class="chip" data-filter="malicious">Złośliwe</button>
+          <button class="chip" data-filter="suspicious">Podejrzane</button>
+        </div>
+      </div>
+      <div id="detectionsTable" class="table-wrap"><p class="muted">Brak danych.</p></div>
+    </div>
+  </section>
+
+  <!-- ========================= KWARANTANNA ========================== -->
+  <section id="quarantine" class="tab-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>Kwarantanna</h2>
+        <button class="btn btn-ghost" id="btnRefreshQuarantine">Odśwież</button>
+      </div>
+      <div id="quarantineList" class="list"><p class="muted">Pusto.</p></div>
+    </div>
+  </section>
+
+  <!-- ========================== SYGNATURY =========================== -->
+  <section id="sigs" class="tab-panel">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head">
+          <h2>Bazy sygnatur</h2>
+          <button class="btn btn-primary" id="btnUpdateSigs2">Aktualizuj</button>
+        </div>
+        <div id="sigStats" class="kv"></div>
+        <div id="sigSources" class="sources"></div>
+      </div>
+      <div class="card">
+        <h2>Dodaj własny IOC</h2>
+        <p class="note">Dodaj skrót pliku (MD5, SHA1 lub SHA256), aby silnik
+        rozpoznawał go natychmiast przy każdym skanie.</p>
+        <div class="scan-form column">
+          <input type="text" id="iocHash" placeholder="sha256 / sha1 / md5">
+          <input type="text" id="iocName" placeholder="nazwa zagrożenia">
+          <button class="btn" id="btnAddIoc">Dodaj do bazy</button>
+        </div>
+        <p class="note" id="iocNote"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========================== USTAWIENIA ========================== -->
+  <section id="settings" class="tab-panel">
+    <div class="card">
+      <h2>Ustawienia silnika</h2>
+      <div class="settings-grid" id="settingsForm"></div>
+      <button class="btn btn-primary" id="btnSaveSettings">Zapisz ustawienia</button>
+      <p class="note" id="settingsNote"></p>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <span id="footerStatus">ładowanie…</span>
+  <span class="muted">AntyVirus — edukacyjny silnik detekcji. Nie zastępuje komercyjnego produktu AV.</span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

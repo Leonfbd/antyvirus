@@ -1,0 +1,23 @@
+# katalog roboczy silnika: bazy sygnatur, kwarantanna, historia skanów
+data/
+!data/sigs/hashlists/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# narzędzia
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# system
+.DS_Store
+Thumbs.db
+*.swp
