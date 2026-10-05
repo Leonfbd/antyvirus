@@ -487,6 +487,115 @@ class TestIntegrityScanning(unittest.TestCase):
             self.assertTrue(any("hidden_sockets" in s for s in report["skipped"]))
 
 
+
+
+class TestBehaviorSandbox(unittest.TestCase):
+    """Analiza behawioralna: uruchamiamy próbkę i patrzymy, co robi.
+
+    Wymaga kompilatora C (gcc) do zbudowania interceptora wywołań libc.
+    Próbki są własne i niegroźne: piszą tylko w katalogu piaskownicy, a
+    użyty adres 192.0.2.x należy do zarezerwowanego zakresu testowego.
+    """
+
+    def _sandbox(self, tmp, timeout: int = 25):
+        from avengine.behavior import BehaviorSandbox
+        return BehaviorSandbox(Path(tmp), timeout=timeout)
+
+    def test_interceptor_is_built(self):
+        import shutil
+        if not (shutil.which("gcc") or shutil.which("cc")):
+            self.skipTest("brak kompilatora C")
+        from avengine.behavior import build_interceptor
+        with tempfile.TemporaryDirectory() as tmp:
+            library = build_interceptor(Path(tmp))
+            self.assertIsNotNone(library, "kompilacja interceptora nie powiodła się")
+            self.assertTrue(Path(library).exists())
+
+    def _skip_without_gcc(self):
+        import shutil
+        if not (shutil.which("gcc") or shutil.which("cc")):
+            self.skipTest("brak kompilatora C")
+
+    def test_malicious_behavior_is_detected(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "behav_dropper.py")
+            self.assertEqual(report.error, "", report.error)
+            self.assertTrue(report.executed)
+            rules = {f.rule for f in report.findings}
+            for expected in ("persistence_write", "credential_access", "network_c2",
+                             "mass_file_write", "self_delete", "encrypted_content"):
+                self.assertIn(expected, rules, f"nie wykryto {expected}: {sorted(rules)}")
+            self.assertEqual(report.verdict, "malicious")
+
+    def test_benign_behavior_stays_clean(self):
+        """Zwykły skrypt nie może dostać ani punktu - to test na fałszywe alarmy."""
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "clean" / "behav_benign.sh")
+            self.assertEqual(report.error, "", report.error)
+            self.assertEqual(report.findings, [],
+                             f"fałszywy alarm: {[f.rule for f in report.findings]}")
+            self.assertEqual(report.verdict, "clean")
+
+    def test_network_endpoints_are_parsed_correctly(self):
+        """Pola CONNECT (rodzina/host/port) nie mogą się przesuwać."""
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "behav_dropper.py")
+            endpoint = next((n for n in report.network if n["port"] == 4444), None)
+            self.assertIsNotNone(endpoint, f"nie sparsowano połączenia: {report.network}")
+            self.assertEqual(endpoint["host"], "192.0.2.1")
+            self.assertEqual(endpoint["family"], "ipv4")
+
+    def test_findings_carry_mitre_ids(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "behav_dropper.py")
+            self.assertTrue(report.findings)
+            for finding in report.findings:
+                self.assertTrue(finding.mitre,
+                                f"{finding.rule} nie ma przypisanej techniki ATT&CK")
+
+    def test_report_is_serialisable(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "clean" / "behav_benign.sh")
+            payload = json.loads(json.dumps(report.to_dict(), ensure_ascii=False))
+            self.assertEqual(payload["verdict"], "clean")
+            self.assertTrue(payload["limitations"], "raport musi wymieniać ograniczenia")
+            self.assertIn("Analiza behawioralna", report.render_text())
+
+    def test_windows_only_script_is_reported_not_run(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "dropper.ps1")
+            self.assertTrue(report.error, "skrypt PowerShell nie powinien być uruchomiony")
+            self.assertFalse(report.executed)
+
+    def test_log_parser_handles_every_event_kind(self):
+        """Parser dziennika musi rozumieć każdy rodzaj zdarzenia interceptora."""
+        from avengine.behavior import BehaviorSandbox
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "behavior.log"
+            log.write_text(
+                "OPEN\t1\t/tmp/a.txt\twrite\n"
+                "OPEN\t1\t/etc/shadow\tread\n"
+                "EXEC\t1\t/usr/bin/curl\thttp://x/y\n"
+                "DELETE\t1\t/tmp/b.txt\n"
+                "MOVE\t1\t/tmp/c\t/tmp/d\n"
+                "CONNECT\t1\tipv4\t192.0.2.1\t4444\n"
+                "SOCKET\t1\tipv4\ttcp\n"
+                "MKDIR\t1\t/tmp/e\n")
+            events = BehaviorSandbox._parse_log(log)
+            kinds = [e.kind for e in events]
+            self.assertEqual(kinds, ["OPEN", "OPEN", "EXEC", "DELETE", "MOVE",
+                                     "CONNECT", "SOCKET", "MKDIR"])
+            connect = next(e for e in events if e.kind == "CONNECT")
+            self.assertEqual(connect.path, "ipv4")
+            self.assertEqual(connect.extra, "192.0.2.1\t4444")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -877,6 +986,115 @@ class TestIntegrityScanning(unittest.TestCase):
             self.assertNotIn("hidden_port", rules,
                              "fałszywy alarm: gniazdka bez widocznych deskryptorów")
             self.assertTrue(any("hidden_sockets" in s for s in report["skipped"]))
+
+
+
+
+class TestBehaviorSandbox(unittest.TestCase):
+    """Analiza behawioralna: uruchamiamy próbkę i patrzymy, co robi.
+
+    Wymaga kompilatora C (gcc) do zbudowania interceptora wywołań libc.
+    Próbki są własne i niegroźne: piszą tylko w katalogu piaskownicy, a
+    użyty adres 192.0.2.x należy do zarezerwowanego zakresu testowego.
+    """
+
+    def _sandbox(self, tmp, timeout: int = 25):
+        from avengine.behavior import BehaviorSandbox
+        return BehaviorSandbox(Path(tmp), timeout=timeout)
+
+    def test_interceptor_is_built(self):
+        import shutil
+        if not (shutil.which("gcc") or shutil.which("cc")):
+            self.skipTest("brak kompilatora C")
+        from avengine.behavior import build_interceptor
+        with tempfile.TemporaryDirectory() as tmp:
+            library = build_interceptor(Path(tmp))
+            self.assertIsNotNone(library, "kompilacja interceptora nie powiodła się")
+            self.assertTrue(Path(library).exists())
+
+    def _skip_without_gcc(self):
+        import shutil
+        if not (shutil.which("gcc") or shutil.which("cc")):
+            self.skipTest("brak kompilatora C")
+
+    def test_malicious_behavior_is_detected(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "behav_dropper.py")
+            self.assertEqual(report.error, "", report.error)
+            self.assertTrue(report.executed)
+            rules = {f.rule for f in report.findings}
+            for expected in ("persistence_write", "credential_access", "network_c2",
+                             "mass_file_write", "self_delete", "encrypted_content"):
+                self.assertIn(expected, rules, f"nie wykryto {expected}: {sorted(rules)}")
+            self.assertEqual(report.verdict, "malicious")
+
+    def test_benign_behavior_stays_clean(self):
+        """Zwykły skrypt nie może dostać ani punktu - to test na fałszywe alarmy."""
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "clean" / "behav_benign.sh")
+            self.assertEqual(report.error, "", report.error)
+            self.assertEqual(report.findings, [],
+                             f"fałszywy alarm: {[f.rule for f in report.findings]}")
+            self.assertEqual(report.verdict, "clean")
+
+    def test_network_endpoints_are_parsed_correctly(self):
+        """Pola CONNECT (rodzina/host/port) nie mogą się przesuwać."""
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "behav_dropper.py")
+            endpoint = next((n for n in report.network if n["port"] == 4444), None)
+            self.assertIsNotNone(endpoint, f"nie sparsowano połączenia: {report.network}")
+            self.assertEqual(endpoint["host"], "192.0.2.1")
+            self.assertEqual(endpoint["family"], "ipv4")
+
+    def test_findings_carry_mitre_ids(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "behav_dropper.py")
+            self.assertTrue(report.findings)
+            for finding in report.findings:
+                self.assertTrue(finding.mitre,
+                                f"{finding.rule} nie ma przypisanej techniki ATT&CK")
+
+    def test_report_is_serialisable(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "clean" / "behav_benign.sh")
+            payload = json.loads(json.dumps(report.to_dict(), ensure_ascii=False))
+            self.assertEqual(payload["verdict"], "clean")
+            self.assertTrue(payload["limitations"], "raport musi wymieniać ograniczenia")
+            self.assertIn("Analiza behawioralna", report.render_text())
+
+    def test_windows_only_script_is_reported_not_run(self):
+        self._skip_without_gcc()
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._sandbox(tmp).run(SAMPLES / "malicious" / "dropper.ps1")
+            self.assertTrue(report.error, "skrypt PowerShell nie powinien być uruchomiony")
+            self.assertFalse(report.executed)
+
+    def test_log_parser_handles_every_event_kind(self):
+        """Parser dziennika musi rozumieć każdy rodzaj zdarzenia interceptora."""
+        from avengine.behavior import BehaviorSandbox
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "behavior.log"
+            log.write_text(
+                "OPEN\t1\t/tmp/a.txt\twrite\n"
+                "OPEN\t1\t/etc/shadow\tread\n"
+                "EXEC\t1\t/usr/bin/curl\thttp://x/y\n"
+                "DELETE\t1\t/tmp/b.txt\n"
+                "MOVE\t1\t/tmp/c\t/tmp/d\n"
+                "CONNECT\t1\tipv4\t192.0.2.1\t4444\n"
+                "SOCKET\t1\tipv4\ttcp\n"
+                "MKDIR\t1\t/tmp/e\n")
+            events = BehaviorSandbox._parse_log(log)
+            kinds = [e.kind for e in events]
+            self.assertEqual(kinds, ["OPEN", "OPEN", "EXEC", "DELETE", "MOVE",
+                                     "CONNECT", "SOCKET", "MKDIR"])
+            connect = next(e for e in events if e.kind == "CONNECT")
+            self.assertEqual(connect.path, "ipv4")
+            self.assertEqual(connect.extra, "192.0.2.1\t4444")
 
 
 if __name__ == "__main__":

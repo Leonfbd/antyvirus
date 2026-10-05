@@ -50,6 +50,7 @@ $$('.tab').forEach((tab) => tab.addEventListener('click', () => {
   if (tab.dataset.tab === 'processes') loadProcesses();
   if (tab.dataset.tab === 'startup') loadStartup();
   if (tab.dataset.tab === 'integrity') loadIntegrity(true);
+  if (tab.dataset.tab === 'sandbox') loadSandboxLimits();
   if (tab.dataset.tab === 'sigs') loadSigs();
   if (tab.dataset.tab === 'settings') loadSettings();
 }));
@@ -678,4 +679,88 @@ function renderIntegrity(data) {
   $('#integNotCovered').innerHTML = (data.not_covered || [])
     .map((t) => `<p class="muted">• ${escapeHtml(t)}</p>`).join('')
     || '<p class="muted">brak pozycji</p>';
+}
+
+
+/* ============================ PIASKOWNICA ============================ */
+function loadSandboxLimits() {
+  const box = $('#sandboxLimits');
+  if (!box || box.dataset.loaded) return;
+  fetch('/api/sandbox/limitations')
+    .then((r) => r.json())
+    .then((d) => {
+      box.innerHTML = (d.limitations || []).map((t) => `<p class="muted">• ${escapeHtml(t)}</p>`).join('');
+      box.dataset.loaded = '1';
+    })
+    .catch(() => { box.innerHTML = '<p class="muted">Nie udało się pobrać listy ograniczeń.</p>'; });
+}
+
+$('#sandboxRisk').addEventListener('change', (e) => {
+  $('#btnSandbox').disabled = !e.target.checked;
+});
+
+$('#btnSandbox').addEventListener('click', async () => {
+  const path = $('#sandboxPath').value.trim();
+  const box = $('#sandboxResult');
+  if (!path) { box.innerHTML = '<p class="muted">Podaj ścieżkę do pliku.</p>'; return; }
+  $('#btnSandbox').disabled = true;
+  box.innerHTML = '<p class="muted">Uruchamianie w piaskownicy… (maks. 60 s)</p>';
+  try {
+    const res = await fetch('/api/sandbox', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, timeout: 20 }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'błąd analizy');
+    renderSandbox(data);
+  } catch (err) {
+    box.innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`;
+  } finally {
+    $('#btnSandbox').disabled = !$('#sandboxRisk').checked;
+  }
+});
+
+function renderSandbox(d) {
+  const box = $('#sandboxResult');
+  if (d.error) {
+    box.innerHTML = `<p class="muted">${escapeHtml(d.error)}</p>`;
+    return;
+  }
+  const badge = d.verdict === 'malicious' ? 'malicious'
+    : d.verdict === 'suspicious' ? 'suspicious' : 'clean';
+  const label = d.verdict === 'malicious' ? 'ZŁOŚLIWE ZACHOWANIE'
+    : d.verdict === 'suspicious' ? 'PODEJRZANE ZACHOWANIE' : 'BRAK PODEJRZANYCH ZACHOWAŃ';
+
+  const section = (title, items, render) => (items && items.length)
+    ? `<h4 style="margin:14px 0 6px">${title} (${items.length})</h4>`
+      + items.slice(0, 25).map(render).join('')
+    : '';
+
+  box.innerHTML = `
+    <div class="res-row ${badge}">
+      <div class="res-head">
+        <span><b>${label}</b></span>
+        <span class="badge ${badge}">${d.score} pkt · ${Math.round(d.duration * 100) / 100} s</span>
+      </div>
+      <div class="muted" style="font-size:.78rem;margin-top:4px">
+        ${escapeHtml(d.target)}${d.timed_out ? ' · PRZEKROCZONO LIMIT CZASU — proces zabity' : ''}
+        ${d.exit_code !== null ? ` · kod wyjścia: ${d.exit_code}` : ''}
+      </div>
+    </div>
+    ${(d.findings || []).length ? `<h4 style="margin:14px 0 6px">Ocena zachowania</h4>${d.findings.map((f) => `
+      <div class="finding">
+        <span class="sev sev-${f.severity}">${escapeHtml(f.severity)}</span>
+        <span class="rule">${escapeHtml(f.rule)}</span> <span>+${f.weight}</span>
+        ${f.mitre ? `<span class="muted">· ${escapeHtml(f.mitre)}</span>` : ''}
+        <div>${escapeHtml(f.description)}</div>
+        ${f.evidence ? `<div class="muted" style="font-size:.76rem">${escapeHtml(String(f.evidence).slice(0, 200))}</div>` : ''}
+      </div>`).join('')}` : ''}
+    ${section('Uruchomione procesy', d.processes, (p) => `<div class="muted" style="font-size:.78rem">$ ${escapeHtml(p.path)} ${escapeHtml(p.args || '')}</div>`)}
+    ${section('Zapisy do plików', d.file_writes, (f) => `<div class="muted" style="font-size:.78rem">[${escapeHtml(f.mode)}] ${escapeHtml(f.path)}</div>`)}
+    ${section('Odczyty wrażliwych plików', d.file_reads, (f) => `<div class="muted" style="font-size:.78rem">${escapeHtml(f.path)}</div>`)}
+    ${section('Usunięte pliki', d.deletes, (f) => `<div class="muted" style="font-size:.78rem">${escapeHtml(f.path)}</div>`)}
+    ${section('Połączenia sieciowe', d.network, (n) => `<div class="muted" style="font-size:.78rem">${escapeHtml(n.family)} ${escapeHtml(n.host)}:${n.port}</div>`)}
+    ${d.stdout ? `<h4 style="margin:14px 0 6px">Wyjście próbki</h4><pre class="evidence">${escapeHtml(d.stdout.slice(0, 1500))}</pre>` : ''}
+    ${d.stderr ? `<h4 style="margin:14px 0 6px">Błędy próbki</h4><pre class="evidence">${escapeHtml(d.stderr.slice(0, 1000))}</pre>` : ''}`;
 }

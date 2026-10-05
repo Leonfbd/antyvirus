@@ -35,6 +35,14 @@ class Config:
     trust_system_dirs: bool = True
     system_dir_discount: float = 0.5
 
+    # --- analiza behawioralna (piaskownica) ---
+    # UWAGA: bez roota nie ma pełnej izolacji (brak chroota i namespace'ów),
+    # więc próbka działa na tej samej maszynie. Prawdziwy malware uruchamiaj
+    # w kontenerze albo maszynie wirtualnej.
+    sandbox_timeout: int = 20
+    sandbox_max_memory_mb: int = 512
+    sandbox_max_file_mb: int = 32
+
     # --- wydajność ---
     # ssdeep to czysty Python: ~11 s dla 12 MB. Liczymy go tylko wtedy, gdy
     # baza zawiera hasze fuzzy (inaczej i tak nikt go nie użyje).

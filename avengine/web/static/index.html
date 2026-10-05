@@ -30,6 +30,7 @@
   <button class="tab" data-tab="processes">Procesy</button>
   <button class="tab" data-tab="startup">Autostart</button>
   <button class="tab" data-tab="integrity">Integralność</button>
+  <button class="tab" data-tab="sandbox">Piaskownica</button>
   <button class="tab" data-tab="sigs">Sygnatury</button>
   <button class="tab" data-tab="settings">Ustawienia</button>
 </nav>
@@ -206,6 +207,37 @@
       <p class="note">Uczciwie: bez sterownika kernelowego poniższe techniki
         pozostają niewidoczne. Komercyjne antywirusy mają tu przewagę.</p>
       <div id="integNotCovered"></div>
+    </div>
+  </section>
+
+  <!-- ========================= PIASKOWNICA ========================== -->
+  <section id="sandbox" class="tab-panel">
+    <div class="card">
+      <div class="card-head"><h2>Analiza behawioralna</h2></div>
+      <p class="note">Analiza statyczna widzi, jak plik <em>wygląda</em>. Ta
+        zakładka uruchamia plik i patrzy, <strong>co robi</strong> — potrafi więc
+        wykryć zagrożenie, którego nie zna jeszcze żadna sygnatura.</p>
+
+      <div class="card stat" style="border-left:3px solid var(--warn);margin:12px 0">
+        <span class="label" style="color:var(--warn)">Zanim uruchomisz</span>
+        <span class="hint">Bez uprawnień roota piaskownica <strong>nie izoluje</strong>
+          procesu (brak chroota i przestrzeni nazw). Próbka działa na tej samej
+          maszynie. Prawdziwy malware uruchamiaj w kontenerze lub maszynie
+          wirtualnej.</span>
+      </div>
+
+      <div class="scan-form">
+        <input type="text" id="sandboxPath" placeholder="/ścieżka/do/pliku">
+        <button class="btn btn-primary" id="btnSandbox" disabled>Uruchom</button>
+      </div>
+      <label class="chip" style="margin-top:12px">
+        <input type="checkbox" id="sandboxRisk"> rozumiem ryzyko — uruchamiam na własnej maszynie
+      </label>
+      <div id="sandboxResult" style="margin-top:16px"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Czego ta analiza nie potrafi</h2></div>
+      <div id="sandboxLimits"></div>
     </div>
   </section>
 

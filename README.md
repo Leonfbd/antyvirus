@@ -52,6 +52,7 @@ Dziewięć warstw. Każda dokłada punkty do wspólnego wyniku ryzyka (0–100):
 | — | **Procesy** | obrazy uruchomionych procesów, podszywanie, katalog tymczasowy | 5–50 |
 | — | **Autostart** | klucze Run, usługi, harmonogram, cron, systemd, profile powłoki | 15–50 |
 | — | **Integralność** | rootkity: ukryte procesy i gniazdka, ld.so.preload, AppInit, IFEO, WMI | 18–60 |
+| — | **Piaskownica** | uruchomienie próbki i obserwacja zachowania (pliki, procesy, sieć) | 5–45 |
 
 **Werdykt:** `≥25 pkt` → podejrzany, `≥60 pkt` → złośliwy. Pojedyncze trafienie
 krytyczne (znany hasz, sygnatura malware) daje od razu „złośliwy”, nawet gdy suma
@@ -238,6 +239,68 @@ Dodatkowo heurystyka statystyczna dostaje **rabat w katalogach systemowych**
 alarmów. Rabat nie dotyczy sygnatur exact-match: znany wirus jest wirusem
 niezależnie od katalogu.
 
+## Analiza behawioralna (piaskownica)
+
+Analiza statyczna odpowiada na pytanie „jak ten plik **wygląda**”. Piaskownica
+odpowiada na pytanie „co ten plik **robi**” — i jako jedyna potrafi wykryć
+zagrożenie, którego nie zna jeszcze żadna sygnatura, bo zagrożenie powstało
+wczoraj.
+
+Jak to działa: kompilujemy niewielki interceptor (`avengine/sandbox/interceptor.c`),
+wstrzykujemy go przez `LD_PRELOAD` i uruchamiamy próbkę w odizolowanym katalogu
+z minimalnym środowiskiem, ograniczeniami zasobów (CPU, pamięć, rozmiar pliku)
+i twardym limitem czasu. Interceptor zapisuje do dziennika każdy zapis do pliku,
+uruchomienie procesu i próbę połączenia.
+
+| Zachowanie | Technika | Waga |
+|---|---|---|
+| Zapis do miejsc autostartu / profilu powłoki | `T1547.001` utrwalenie | +32 |
+| Modyfikacja `/etc/passwd`, `sudoers`, `ld.so.preload` | `T1098` manipulacja kontem | +45 |
+| Odczyt `/etc/shadow`, kluczy SSH, portfeli | `T1552.001` poświadczenia | +38 |
+| Zapis treści o bardzo wysokiej entropii | `T1486` szyfrowanie danych | +40 |
+| Masowe zmiany plików (≥20) | `T1486` | +24 |
+| Masowe usuwanie plików, usunięcie własne | `T1485` / `T1070.004` | +24 / +15 |
+| Połączenie ze zdalnym adresem | `T1071` C2 | +20 |
+| Port typowy dla shella zwrotnego | `T1571` nietypowy port | +12 |
+| Uruchomienie narzędzia do pobierania | `T1105` | +25 |
+| Użycie zaufanej binarki (LOLBIN) | `T1218` | +22 |
+
+Na koniec doliczana jest premia za spójny łańcuch — ta sama, która działa przy
+skanie statycznym, tylko że oparta na **zaobserwowanych** faktach.
+
+Przykład (własna, niegroźna próbka testowa):
+
+```
+$ ./avy sandbox samples/malicious/behav_dropper.py
+werdykt: MALICIOUS (100 pkt)
+  [critical] +40  encrypted_content      T1486
+  [critical] +38  credential_access      T1552.001
+  [high    ] +32  persistence_write      T1547.001
+  [high    ] +28  behavior_chain         4 taktyki
+  [high    ] +24  mass_file_write        T1486
+  [high    ] +20  network_c2             T1071  192.0.2.1:4444
+  [medium  ] +15  self_delete            T1070.004
+  [medium  ] +12  suspicious_port        T1571
+```
+
+### Czego ta piaskownica NIE potrafi — i dlaczego o tym piszemy
+
+Prawdziwa izolacja wymaga uprawnień roota (chroot, przestrzenie nazw, sieć
+per-proces) albo osobnej maszyny wirtualnej. Tego moduł **nie ma**, więc:
+
+* **nie izoluje naprawdę** — próbka działa na tej samej maszynie. Prawdziwy
+  malware uruchamiaj w kontenerze lub VM. Panel wymaga zaznaczenia
+  „rozumiem ryzyko”, a CLI wypisuje ostrzeżenie;
+* **nie widzi wszystkiego** — pliki statycznie zlinkowane, binaria Go
+  (surowe syscall-e) i programy setuid omijają `LD_PRELOAD`;
+* **obserwuje libc, nie kernel** — wstrzykiwanie do cudzych procesów i hooki
+  jądra pozostają niewidoczne;
+* na Windows potrzebny jest sterownik minifilter albo ETW/Sysmon — tam moduł
+  zgłasza brak implementacji zamiast udawać, że działa.
+
+Te ograniczenia są wypisane w każdym raporcie i widoczne w panelu. Czysty
+wynik piaskownicy nie oznacza „plik jest bezpieczny”.
+
 ## Instalacja
 
 ```bash
@@ -275,6 +338,7 @@ Wymagania: Python ≥ 3.9, `git` (do aktualizacji baz). Działa na Linuksie i Wi
 ./avy processes                     # skan uruchomionych procesów
 ./avy startup                       # audyt miejsc autostartu
 ./avy integrity                     # kontrola integralności systemu (rootkity)
+./avy sandbox podejrzany.sh         # uruchom w piaskownicy i obserwuj zachowanie
 ./avy report ~/Pobrane -o raport.html   # skan + raport HTML (lub --format json/txt)
 ./avy serve --port 8080             # panel WWW
 ```
@@ -290,13 +354,15 @@ Wymagania: Python ≥ 3.9, `git` (do aktualizacji baz). Działa na Linuksie i Wi
 Zakładki: **Pulpit** (stan, szybkie akcje, zdarzenia), **Skanowanie** (ścieżka,
 przeglądarka katalogów, postęp na żywo, wyniki z dowodami), **Wykrycia** (historia
 z filtrem), **Kwarantanna** (przywracanie i usuwanie), **Procesy** i **Autostart**
-(utrwalanie), **Integralność** (rootkity i słaba konfiguracja), **Sygnatury**
-(źródła, aktualizacja, dodawanie IOC), **Ustawienia** (progi, wątki, izolacja).
+(utrwalanie), **Integralność** (rootkity i słaba konfiguracja), **Piaskownica**
+(uruchomienie próbki i obserwacja zachowania), **Sygnatury** (źródła,
+aktualizacja, dodawanie IOC), **Ustawienia** (progi, wątki, izolacja).
 
 API REST (dokumentacja pod `/api/docs`): `/api/status`, `/api/scan`,
 `/api/scan/{job}`, `/api/detections`, `/api/events`, `/api/quarantine`,
 `/api/sigs/update`, `/api/realtime`, `/api/config`, `/api/processes`,
-`/api/startup`, `/api/integrity`, `/api/report/{job_id}?fmt=html|json|txt`.
+`/api/startup`, `/api/integrity`, `/api/report/{job_id}?fmt=html|json|txt`,
+`/api/sandbox` (POST: `{"path": "...", "timeout": 20}`).
 
 ### Jako biblioteka
 
@@ -384,7 +450,7 @@ Kluczowe optymalizacje:
 python3 -m unittest discover -s tests -v
 ```
 
-50 testów:
+58 testów:
 
 * parser sygnatur ClamAV (składnia, wildcardy, dopasowanie), entropia,
   rozpoznawanie typów, kwarantanna, raporty HTML/JSON;
@@ -395,6 +461,11 @@ python3 -m unittest discover -s tests -v
   zostaje czysty;
 * **korelacja i MITRE** — mapowanie technik, premia za łańcuch ataku, rabat
   heurystyki w katalogach systemowych;
+* **analiza behawioralna** — budowa interceptora, wykrycie utrwalenia /
+  kradzieży poświadczeń / C2 / szyfrowania / samousunięcia, poprawne
+  parsowanie pól połączenia (rodzina/host/port), przypisanie technik ATT&CK,
+  brak fałszywych alarmów dla zwykłego skryptu, odmowa uruchomienia skryptu
+  PowerShell, serializacja raportu, parser dziennika dla wszystkich zdarzeń;
 * **integralność** — `ld.so.preload`, ukryty proces, dodatkowe konto UID 0,
   binaria SUID w katalogu zapisywalnym oraz test *negatywny*: sprawdzenie
   ukrytych gniazdek bez uprawnień do `/proc/<pid>/fd` musi zostać pominięte,
@@ -436,6 +507,8 @@ avengine/
 │   ├── documents.py       # 8. Office (OLE2/OOXML) i PDF
 │   └── correlation.py     # 9. łańcuch ataku (MITRE) i rabat za kontekst
 ├── mitre.py  rootkit.py   # mapowanie ATT&CK, integralność systemu
+├── behavior.py            # analiza behawioralna (piaskownica)
+├── sandbox/interceptor.c  # interceptor wywołań libc (LD_PRELOAD)
 ├── sigs/  store.py  clamav.py  updater.py
 ├── processes.py  startup_audit.py  archives.py  report.py
 ├── cli.py                 # `avy`
@@ -458,6 +531,11 @@ tools/make_samples.py  tests/  samples/
   budził złudnego poczucia bezpieczeństwa.
 * Część testów integralności wymaga uprawnień roota (odczyt `/proc/<pid>/fd`).
   Bez nich są pomijane — wymienione w raporcie.
+* Piaskownica wymaga kompilatora C (gcc). Bez niego testy są pomijane, a moduł
+  zwraca czytelny błąd zamiast udawać analizę.
+* Wymagania: `pip install -r requirements.txt` pobiera zależności, a
+  `avy update` klonuje bazy reguł do `data/`. Katalog `data/` nie jest
+  śledzony przez git — po klonowaniu repozytorium trzeba je odtworzyć.
 * Bazy społecznościowe są darmowe, więc też widoczne dla autorów malware —
   wykrywają to, co już znane.
 

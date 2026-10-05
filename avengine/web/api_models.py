@@ -35,3 +35,8 @@ class ConfigUpdate(BaseModel):
 class IOCRequest(BaseModel):
     hash_value: str
     name: str = "dodane ręcznie"
+
+
+class SandboxRequest(BaseModel):
+    path: str
+    timeout: Optional[int] = None       # sekundy, ograniczone po stronie serwera

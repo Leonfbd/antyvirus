@@ -16,7 +16,8 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config import Config
 from ..models import Verdict
-from .api_models import ConfigUpdate, IOCRequest, RealtimeRequest, ScanRequest
+from .api_models import (ConfigUpdate, IOCRequest, RealtimeRequest,
+                        SandboxRequest, ScanRequest)
 
 log = logging.getLogger(__name__)
 
@@ -173,6 +174,31 @@ class AVWebApp:
         @app.get("/api/startup")
         def startup(refresh: int = 0):
             return self._cached("startup", refresh)
+
+        @app.post("/api/sandbox")
+        def sandbox(request: SandboxRequest):
+            from pathlib import Path as _Path
+            from ..behavior import BehaviorSandbox
+            target = _Path(request.path)
+            if not target.exists():
+                raise HTTPException(404, f"Nie ma takiego pliku: {request.path}")
+            # Twardy limit: to operacja dłuższa niż zwykły skan, a serwer
+            # nie może zostać zablokowany na kilka minut.
+            timeout = max(1, min(int(request.timeout or self.config.sandbox_timeout), 60))
+            sandbox = BehaviorSandbox(
+                self.config.data_dir, timeout=timeout,
+                max_memory_mb=self.config.sandbox_max_memory_mb,
+                max_file_mb=self.config.sandbox_max_file_mb)
+            try:
+                report = sandbox.run(target, timeout=timeout)
+            except Exception as exc:
+                raise HTTPException(500, f"Analiza behawioralna nie powiodła się: {exc}")
+            return report.to_dict()
+
+        @app.get("/api/sandbox/limitations")
+        def sandbox_limitations():
+            from ..behavior import BehaviorSandbox
+            return {"limitations": BehaviorSandbox._limitations()}
 
         @app.get("/api/integrity")
         def integrity():

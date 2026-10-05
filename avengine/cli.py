@@ -473,6 +473,34 @@ def cmd_integrity(args: argparse.Namespace) -> int:
     return 1 if report["counts"]["critical"] else 0
 
 
+def cmd_sandbox(args: argparse.Namespace) -> int:
+    """Uruchomienie próbki w piaskownicy i obserwacja jej zachowania."""
+    cfg = Config()
+    cfg.ensure_dirs()
+    target = Path(args.path)
+    if not target.exists():
+        print(f"Nie ma takiego pliku: {target}")
+        return 2
+
+    print(_color(
+        "UWAGA: bez uprawnień roota piaskownica nie izoluje procesu "
+        "(brak chroota i namespace'ów).", "suspicious"))
+    print("Prawdziwy malware uruchamiaj w kontenerze lub maszynie wirtualnej.\n")
+
+    from .behavior import BehaviorSandbox
+    sandbox = BehaviorSandbox(cfg.data_dir, timeout=args.timeout or cfg.sandbox_timeout,
+                              max_memory_mb=cfg.sandbox_max_memory_mb,
+                              max_file_mb=cfg.sandbox_max_file_mb)
+    report = sandbox.run(target, timeout=args.timeout or cfg.sandbox_timeout)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
+        return 1 if report.verdict == "malicious" else 0
+
+    print(report.render_text())
+    return 1 if report.verdict == "malicious" else 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     """Skan + raport HTML/JSON do pliku."""
     cfg = Config()
@@ -577,6 +605,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--all", action="store_true", help="pokaż też wpisy bez ryzyka")
     p.add_argument("--limit", type=int, default=40)
     p.set_defaults(func=cmd_startup)
+
+    # sandbox
+    p = sub.add_parser("sandbox", help="uruchom plik w piaskownicy i obserwuj zachowanie")
+    p.add_argument("path")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="limit czasu w sekundach (domyślnie z konfiguracji)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sandbox)
 
     # integrity
     p = sub.add_parser("integrity", aliases=["rootkit"],
