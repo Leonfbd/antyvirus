@@ -49,6 +49,7 @@ $$('.tab').forEach((tab) => tab.addEventListener('click', () => {
   if (tab.dataset.tab === 'quarantine') loadQuarantine();
   if (tab.dataset.tab === 'processes') loadProcesses();
   if (tab.dataset.tab === 'startup') loadStartup();
+  if (tab.dataset.tab === 'integrity') loadIntegrity(true);
   if (tab.dataset.tab === 'sigs') loadSigs();
   if (tab.dataset.tab === 'settings') loadSettings();
 }));
@@ -468,6 +469,7 @@ function renderStartup(data, age) {
     </div>`).join('');
 }
 $('#btnRefreshStartup').addEventListener('click', () => loadStartup(true));
+$('#btnRefreshIntegrity').addEventListener('click', () => loadIntegrity(true));
 
 /* -------------------------------- sygnatury ------------------------------ */
 async function loadSigs() {
@@ -610,3 +612,70 @@ function escapeHtml(text) {
   loadDetections();
   setInterval(() => { loadStatus(); loadEvents(); }, 5000);
 })();
+
+
+/* ======================= INTEGRALNOŚĆ SYSTEMU ======================= */
+async function loadIntegrity(refresh = false) {
+  const box = $('#integList');
+  if (!box) return;
+  box.innerHTML = '<p class="muted">Sprawdzanie integralności…</p>';
+  try {
+    const data = await api(`/api/integrity${refresh ? '?refresh=1' : ''}`);
+    renderIntegrity(data);
+  } catch (err) {
+    box.innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function renderIntegrity(data) {
+  if (!data || data.error) {
+    $('#integList').innerHTML =
+      `<p class="muted">${escapeHtml((data && data.error) || 'brak danych')}</p>`;
+    return;
+  }
+  const findings = data.findings || [];
+  const hardening = data.hardening || [];
+  const c = data.counts || {};
+  const checked = (data.checked || []).length;
+  const skipped = data.skipped || [];
+
+  $('#integSummary').innerHTML = `
+    <div class="card stat"><span class="label">Oznaki włamania</span>
+      <strong class="${c.critical ? 'danger' : ''}">${c.critical || 0}</strong>
+      <span class="hint">krytyczne</span></div>
+    <div class="card stat"><span class="label">Wysokie</span>
+      <strong style="color:var(--warn)">${c.high || 0}</strong></div>
+    <div class="card stat"><span class="label">Testów wykonanych</span>
+      <strong>${checked}</strong>
+      <span class="hint">${skipped.length ? 'pominięto: ' + skipped.length : 'wszystkie'}</span></div>`;
+
+  $('#integList').innerHTML = findings.length
+    ? findings.map((f) => `
+      <div class="res-row ${f.severity === 'critical' ? 'malicious' : f.severity === 'high' ? 'suspicious' : 'clean'}">
+        <div class="res-head">
+          <span><b>${escapeHtml(f.rule)}</b></span>
+          <span class="badge ${f.severity === 'critical' ? 'malicious' : f.severity === 'high' ? 'suspicious' : 'clean'}">
+            ${escapeHtml(f.severity)} · +${f.weight} pkt</span>
+        </div>
+        <div style="margin-top:4px">${escapeHtml(f.description)}</div>
+        ${f.evidence ? `<div class="muted" style="font-size:.76rem;margin-top:4px">${escapeHtml(String(f.evidence).slice(0, 300))}</div>` : ''}
+        ${f.mitre ? `<div class="muted" style="font-size:.76rem">MITRE: ${escapeHtml(f.mitre)}</div>` : ''}
+      </div>`).join('')
+    : `<p class="muted">Nie wykryto oznak naruszenia integralności
+       (${checked} testów wykonanych${skipped.length ? ', pominięto: ' + escapeHtml(skipped.join(', ')) : ''}).</p>`;
+
+  $('#integHardening').innerHTML = hardening.length
+    ? hardening.map((f) => `
+      <div class="res-row clean">
+        <div class="res-head">
+          <span>${escapeHtml(f.description)}</span>
+          <span class="badge clean">${escapeHtml(f.severity)}</span>
+        </div>
+        ${f.evidence ? `<div class="muted" style="font-size:.76rem">${escapeHtml(String(f.evidence).slice(0, 200))}</div>` : ''}
+      </div>`).join('')
+    : '<p class="muted">Nie wykryto słabych punktów konfiguracji.</p>';
+
+  $('#integNotCovered').innerHTML = (data.not_covered || [])
+    .map((t) => `<p class="muted">• ${escapeHtml(t)}</p>`).join('')
+    || '<p class="muted">brak pozycji</p>';
+}

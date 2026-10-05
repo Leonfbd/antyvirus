@@ -13,6 +13,8 @@ from .config import Config
 from .detectors.archive import ArchiveDetector
 from .detectors.base import Detector, ScanContext
 from .detectors.clamav_sig import ClamAVDetector
+from .detectors.correlation import CorrelationDetector
+from .detectors.documents import DocumentDetector
 from .detectors.packer import PackerDetector
 from .detectors.pe_heuristics import PEHeuristicsDetector
 from .detectors.script_heuristics import ScriptHeuristicsDetector
@@ -52,6 +54,8 @@ class Engine:
             PackerDetector(),
             ScriptHeuristicsDetector(),
             ArchiveDetector(),
+            DocumentDetector(),
+            CorrelationDetector(),     # musi być ostatnia: koreluje wyniki pozostałych
         ]
         self.loaded = False
 
@@ -130,7 +134,10 @@ class Engine:
         ctx.cache["engine"] = self
         ctx.cache["depth"] = depth
 
+        decisive = False
         for detector in self.detectors:
+            if decisive and getattr(detector, "expensive", True):
+                continue
             try:
                 if not detector.applies_to(ctx):
                     continue
@@ -141,9 +148,11 @@ class Engine:
             except Exception as exc:
                 log.warning("Detektor %s nie powiódł się dla %s: %s",
                             detector.name, path, exc)
-            # Short-circuit: mamy pewny werdykt, nie traćmy czasu na resztę.
+            # Mamy pewny werdykt: pomijamy resztę KOSZTOWNYCH warstw.
+            # Tanie warstwy dopisują kontekst (dokumenty, korelacja), więc
+            # raport nadal wyjaśnia, co znaleziono, a nie tylko „jest źle".
             if result.findings and result.findings[-1].weight >= 100:
-                break
+                decisive = True
 
         result.finalize(self.config.suspicious_threshold, self.config.malicious_threshold)
         result.elapsed_ms = _ms(started)

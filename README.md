@@ -36,7 +36,7 @@ malware i klasycznych technikach działa skutecznie; na nowym, celowanym malware
 
 ## Architektura
 
-Sześć warstw. Każda dokłada punkty do wspólnego wyniku ryzyka (0–100):
+Dziewięć warstw. Każda dokłada punkty do wspólnego wyniku ryzyka (0–100):
 
 | # | Warstwa | Co robi | Waga trafienia |
 |---|---|---|---|
@@ -47,8 +47,11 @@ Sześć warstw. Każda dokłada punkty do wspólnego wyniku ryzyka (0–100):
 | 5 | **Entropia** | pakowanie, kryptory, kompresja | 8–25 |
 | 6 | **Skrypty i makra** | PowerShell / JS / VBS / BAT / makra Office | 8–45 |
 | 7 | **Archiwa** | rozpakowanie ZIP/TAR/7z/RAR/gzip/xz i skan zawartości | 8–100 |
+| 8 | **Dokumenty** | Office (OLE2 i OOXML): makra, osadzenia, DDE; PDF: JavaScript, auto-akcje | 5–45 |
+| 9 | **Korelacja** | łańcuch ataku wg MITRE ATT&CK, rabat za zaufany katalog | 0–32 |
 | — | **Procesy** | obrazy uruchomionych procesów, podszywanie, katalog tymczasowy | 5–50 |
 | — | **Autostart** | klucze Run, usługi, harmonogram, cron, systemd, profile powłoki | 15–50 |
+| — | **Integralność** | rootkity: ukryte procesy i gniazdka, ld.so.preload, AppInit, IFEO, WMI | 18–60 |
 
 **Werdykt:** `≥25 pkt` → podejrzany, `≥60 pkt` → złośliwy. Pojedyncze trafienie
 krytyczne (znany hasz, sygnatura malware) daje od razu „złośliwy”, nawet gdy suma
@@ -62,8 +65,10 @@ plik → typ po magii (nie po rozszerzeniu!) → hasze → PE? → warstwy 1..6 
                                               ≥ progu → kwarantanna + zdarzenie
 ```
 
-Short-circuit: po trafieniu wartym 100 pkt pozostałe warstwy są pomijane — nie ma
-sensu analizować pliku, który już został rozpoznany.
+Short-circuit: po trafieniu wartym 100 pkt pomijane są **kosztowne** warstwy (YARA,
+heurystyka PE, archiwa). Tanie warstwy, które dopisują kontekst (dokumenty,
+korelacja), uruchamiają się nadal — dzięki temu raport tłumaczy, *co* znaleziono,
+zamiast poprzestać na informacji „jest źle”.
 
 ---
 
@@ -173,6 +178,66 @@ zamiast nazw domenowych.
 
 ---
 
+## Dokumenty: makra, osadzenia i PDF
+
+Najczęstszy wektor infekcji nie jest już plikiem `.exe`, tylko dokumentem.
+Przykładowy łańcuch: faktura `.docm` → makro `AutoOpen` → `WScript.Shell`
+→ PowerShell pobierający drugi etap. Żaden element tego łańcucha nie jest
+plikiem wykonywalnym, więc skaner skupiony na PE nic nie zauważy.
+
+| Format | Co sprawdzamy |
+|---|---|
+| **OLE2** (`.doc`, `.xls`, `.ppt`) | strumienie VBA (`Macros/`, `_VBA_PROJECT_CUR`), osadzone obiekty `\x01Ole10Native` **z nazwą pliku**, pola DDE/DDEAUTO |
+| **OOXML** (`.docm`, `.xlsm`, `.docx`) | `vbaProject.bin`, osadzenia, ActiveX, relacje zewnętrzne, zdalne szablony, `ddeLink` |
+| **PDF** | `/JavaScript` + `/OpenAction` (wykonanie przy otwarciu), `/Launch`, `/EmbeddedFile`, `/URI`, XFA, ukryta treść po dekompresji strumieni FlateDecode, uszkodzona tablica xref |
+
+Słowa kluczowe makr są grupowane po **zachowaniu**, nie po nazwie: automatyczne
+uruchomienie (`Auto_Open`, `Document_Open`), uruchomienie powłoki
+(`WScript.Shell`, `Shell`), pobieranie (`URLDownloadToFile`, `ADODB.Stream`),
+zaciemnianie (`Chr()`, `StrReverse`), utrwalanie (`RegWrite`).
+
+## Integralność systemu (rootkity)
+
+Skanowanie plików nie odpowie na pytanie „czy ktoś już jest w środku”. Moduł
+`integrity` konfrontuje ze sobą dwa źródła prawdy o systemie:
+
+| Test | Na czym polega |
+|---|---|
+| Ukryte procesy | PID-y obecne w `/proc`, ale nieznane dla API systemowego |
+| Ukryte gniazdka | inody z `/proc/net/tcp`, których nie da się przypisać do procesu |
+| Ukryte moduły | `/proc/modules` vs `/sys/module` |
+| `ld.so.preload` / `LD_PRELOAD` | biblioteka wstrzykiwana do każdego procesu |
+| Usunięte binaria | procesy działające z plików skasowanych z dysku |
+| SUID/SGID w `/tmp` | gotowy mechanizm podniesienia uprawnień |
+| Konta UID 0 | dodatkowe konta o uprawnieniach roota |
+| Windows | AppInit_DLLs, przejęcie IFEO (`Debugger`), subskrypcje WMI, pakiety LSA, usługi bez cudzysłowu, dodatki netsh, wyłączony Defender |
+
+Dwie decyzje projektowe, które odróżniają ten moduł od naiwnej implementacji:
+
+1. **Osobno oznaki włamania, osobno słaba konfiguracja.** Katalog systemowy
+   zapisywalny dla wszystkich to podatność, nie dowód infekcji — trafia do
+   sekcji *hartowanie* i nie podnosi werdyktu o bezpieczeństwie maszyny.
+2. **Test, którego nie da się wykonać, jest pomijany, a nie zgadywany.**
+   Sprawdzenie ukrytych gniazdek wymaga prawa odczytu `/proc/<pid>/fd` cudzych
+   procesów. Bez uprawnień roota każde gniazdko wyglądałoby na ukryte — moduł
+   wykrywa ten stan (widoczne mniej niż 50 % procesów) i pomija test,
+   informując o tym w raporcie. Wcześniej dawało to cztery fałszywe alarmy.
+
+## Korelacja: łańcuch ataku wg MITRE ATT&CK
+
+Pojedynczy słaby sygnał to szum. Sygnały układające się w **spójny łańcuch** to
+atak. Każde znalezisko dostaje identyfikator techniki (`T1055.012`, `T1486`,
+`T1547.001`…), a premia rośnie wraz z liczbą *różnych taktyk*:
+
+| Różnych taktyk | 0–1 | 2 | 3 | 4 | 5 | 6+ |
+|---|---|---|---|---|---|---|
+| Premia | 0 | +5 | +12 | +20 | +28 | +32 |
+
+Dodatkowo heurystyka statystyczna dostaje **rabat w katalogach systemowych**
+(`/usr/bin`, `C:\Windows\System32`) — tam ma najwyższy odsetek fałszywych
+alarmów. Rabat nie dotyczy sygnatur exact-match: znany wirus jest wirusem
+niezależnie od katalogu.
+
 ## Instalacja
 
 ```bash
@@ -209,6 +274,7 @@ Wymagania: Python ≥ 3.9, `git` (do aktualizacji baz). Działa na Linuksie i Wi
 ./avy ioc add podejrzany.exe Nazwa  # dodaj własny wskaźnik
 ./avy processes                     # skan uruchomionych procesów
 ./avy startup                       # audyt miejsc autostartu
+./avy integrity                     # kontrola integralności systemu (rootkity)
 ./avy report ~/Pobrane -o raport.html   # skan + raport HTML (lub --format json/txt)
 ./avy serve --port 8080             # panel WWW
 ```
@@ -223,12 +289,14 @@ Wymagania: Python ≥ 3.9, `git` (do aktualizacji baz). Działa na Linuksie i Wi
 
 Zakładki: **Pulpit** (stan, szybkie akcje, zdarzenia), **Skanowanie** (ścieżka,
 przeglądarka katalogów, postęp na żywo, wyniki z dowodami), **Wykrycia** (historia
-z filtrem), **Kwarantanna** (przywracanie i usuwanie), **Sygnatury** (źródła,
-aktualizacja, dodawanie IOC), **Ustawienia** (progi, wątki, izolacja).
+z filtrem), **Kwarantanna** (przywracanie i usuwanie), **Procesy** i **Autostart**
+(utrwalanie), **Integralność** (rootkity i słaba konfiguracja), **Sygnatury**
+(źródła, aktualizacja, dodawanie IOC), **Ustawienia** (progi, wątki, izolacja).
 
 API REST (dokumentacja pod `/api/docs`): `/api/status`, `/api/scan`,
 `/api/scan/{job}`, `/api/detections`, `/api/events`, `/api/quarantine`,
-`/api/sigs/update`, `/api/realtime`, `/api/config`.
+`/api/sigs/update`, `/api/realtime`, `/api/config`, `/api/processes`,
+`/api/startup`, `/api/integrity`, `/api/report/{job_id}?fmt=html|json|txt`.
 
 ### Jako biblioteka
 
@@ -316,17 +384,36 @@ Kluczowe optymalizacje:
 python3 -m unittest discover -s tests -v
 ```
 
-36 testów: parser sygnatur ClamAV (składnia, wildcardy, dopasowanie),
-**archiwa** (EICAR w ZIP, czysty ZIP zostaje czysty, path traversal, bomba zip,
-zaszyfrowane 7z), entropia, werdykty dla próbek, kwarantanna, rozpoznawanie
-typów, raporty HTML/JSON, **klasyfikacja reguł YARA** (reguły informacyjne nie
-punktują, lista tłumień jest ładowana, reguły kanarkowe są odrzucane) oraz test
-„czysty plik PE pozostaje czysty” przy załadowanych pełnych bazach
-społecznościowych.
+50 testów:
+
+* parser sygnatur ClamAV (składnia, wildcardy, dopasowanie), entropia,
+  rozpoznawanie typów, kwarantanna, raporty HTML/JSON;
+* **archiwa** — EICAR w ZIP, czysty ZIP zostaje czysty, path traversal, bomba
+  zip, zaszyfrowane 7z (szyfrowanie = „nieprzebadane”, nie „czyste”);
+* **dokumenty** — PDF z JavaScriptem i `/OpenAction`, czysty PDF zostaje czysty,
+  dokument z makrem jest wykrywany *wraz z opisem zachowania*, czysty `.docx`
+  zostaje czysty;
+* **korelacja i MITRE** — mapowanie technik, premia za łańcuch ataku, rabat
+  heurystyki w katalogach systemowych;
+* **integralność** — `ld.so.preload`, ukryty proces, dodatkowe konto UID 0,
+  binaria SUID w katalogu zapisywalnym oraz test *negatywny*: sprawdzenie
+  ukrytych gniazdek bez uprawnień do `/proc/<pid>/fd` musi zostać pominięte,
+  a nie zgłosić fałszywy alarm;
+* **klasyfikacja reguł YARA** — reguły informacyjne nie punktują, lista tłumień
+  jest ładowana, reguły kanarkowe są odrzucane, czysty plik PE pozostaje czysty
+  przy załadowanych pełnych bazach społecznościowych.
+
+Testy integralności używają syntetycznych katalogów (`/proc` i `/etc/passwd`
+podstawione na katalogi tymczasowe) — nigdy nie dotykają prawdziwego systemu.
 
 `tools/make_samples.py` tworzy nieaktywne pliki testowe (EICAR, syntetyczny PE z
-cechami packera, skrypt droppujący, skrypt ransomware). Nie uruchamiaj ich —
-nie zawierają działającego kodu, ale mają strukturę typową dla malware.
+cechami packera, skrypt droppujący, skrypt ransomware, dokument z makrem, PDF z
+JavaScriptem). Nie uruchamiaj ich — nie zawierają działającego kodu, ale mają
+strukturę typową dla malware.
+
+> Uwaga praktyczna z developmentu: skanowanie katalogu `samples/` z włączoną
+> kwarantanną **przenosi próbki poza katalog**. Jeśli fixture zniknie, zajrzyj do
+> `data/quarantine/` (metadane w plikach `.json` zawierają oryginalną ścieżkę).
 
 ---
 
@@ -344,7 +431,11 @@ avengine/
 │   ├── yara_layer.py      # 3. YARA + klasyfikacja reguł
 │   ├── pe_heuristics.py   # 4. struktura PE
 │   ├── packer.py          # 5. entropia
-│   └── script_heuristics.py  # 6. skrypty i makra
+│   ├── script_heuristics.py  # 6. skrypty i makra
+│   ├── archive.py         # 7. archiwa
+│   ├── documents.py       # 8. Office (OLE2/OOXML) i PDF
+│   └── correlation.py     # 9. łańcuch ataku (MITRE) i rabat za kontekst
+├── mitre.py  rootkit.py   # mapowanie ATT&CK, integralność systemu
 ├── sigs/  store.py  clamav.py  updater.py
 ├── processes.py  startup_audit.py  archives.py  report.py
 ├── cli.py                 # `avy`
@@ -361,6 +452,12 @@ tools/make_samples.py  tests/  samples/
   zawartość RAR pozostaje nieprzebadana.
 * Procesy są oceniane po ich obrazie na dysku, nie po zawartości pamięci
   (do analizy pamięci potrzebny jest sterownik kernelowy).
+* Kontrola integralności nie wykrywa hooków jądra (SSDT/IDT) ani modyfikacji
+  pamięci jądra (DKOM) — to wymaga podpisanego sterownika. Moduł wymienia te
+  techniki wprost jako pozostające poza zasięgiem, żeby czysty wynik nie
+  budził złudnego poczucia bezpieczeństwa.
+* Część testów integralności wymaga uprawnień roota (odczyt `/proc/<pid>/fd`).
+  Bez nich są pomijane — wymienione w raporcie.
 * Bazy społecznościowe są darmowe, więc też widoczne dla autorów malware —
   wykrywają to, co już znane.
 

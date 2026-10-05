@@ -13,6 +13,7 @@ aiofiles>=23.2
 watchdog>=4.0
 
 # Skany dodatkowe
+olefile
 psutil>=5.9             # skanowanie procesów (Windows/Linux)
 py7zr>=1.0              # archiwa 7z
 

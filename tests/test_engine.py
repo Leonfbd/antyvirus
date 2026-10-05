@@ -276,6 +276,217 @@ class TestYaraClassification(unittest.TestCase):
                              f"fałszywy alarm: {[(f.rule, f.weight) for f in result.findings]}")
 
 
+
+SAMPLES = Path(__file__).resolve().parent.parent / "samples"
+
+
+class TestDocumentAnalysis(unittest.TestCase):
+    """Dokumenty to dziś główny wektor infekcji - muszą być analizowane."""
+
+    def _engine(self, tmp):
+        engine = Engine(make_config(tmp))
+        engine.load(load_yara=False)
+        return engine
+
+    def _scan(self, tmp, path: Path):
+        return self._engine(tmp).scan_file(str(path))
+
+    def test_pdf_with_javascript_and_openaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "malicious" / "raport.pdf")
+            rules = [f.rule for f in result.findings]
+            self.assertIn("pdf_js_auto", rules, f"nie wykryto: {rules}")
+            self.assertEqual(result.verdict, Verdict.MALICIOUS.value)
+
+    def test_clean_pdf_stays_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "clean" / "dokument.pdf")
+            doc_findings = [f.rule for f in result.findings if f.detector == "documents"]
+            self.assertEqual(doc_findings, [], f"fałszywy alarm: {doc_findings}")
+            self.assertEqual(result.verdict, Verdict.CLEAN.value)
+
+    def test_ooxml_macro_is_detected_with_details(self):
+        """Makro musi być nie tylko wykryte, ale i opisane (co robi)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "malicious" / "faktura.docm")
+            rules = [f.rule for f in result.findings]
+            self.assertIn("ooxml_macro", rules, f"nie wykryto makra: {rules}")
+            # Szczegóły są ważniejsze od samej flagi: analityk musi wiedzieć,
+            # że makro uruchamia się samo i pobiera coś z sieci.
+            self.assertIn("vba_autorun", rules)
+            self.assertIn("macro_download", rules)
+
+    def test_clean_docx_stays_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "clean" / "raport.docx")
+            doc_findings = [f.rule for f in result.findings if f.detector == "documents"]
+            self.assertEqual(doc_findings, [], f"fałszywy alarm: {doc_findings}")
+
+
+class TestMitreMapping(unittest.TestCase):
+    def test_known_techniques_are_mapped(self):
+        from avengine import mitre
+        cases = {
+            ("pe_heuristics", "api_hollowing"): "T1055.012",
+            ("pe_heuristics", "api_ransomware"): "T1486",
+            ("documents", "pdf_js_auto"): "T1204.002",
+            ("rootkit", "ld_so_preload"): "T1574.006",
+            ("archive", "nested_threat"): "T1566.001",
+        }
+        for (detector, rule), expected in cases.items():
+            technique = mitre.map_finding(detector, rule)
+            self.assertIsNotNone(technique, f"{detector}/{rule} nie zmapowane")
+            self.assertEqual(technique.id, expected)
+
+    def test_chain_bonus_grows_with_distinct_tactics(self):
+        from avengine import mitre
+        self.assertEqual(mitre.chain_bonus(1), 0)
+        self.assertEqual(mitre.chain_bonus(2), 5)
+        self.assertEqual(mitre.chain_bonus(3), 12)
+        self.assertGreater(mitre.chain_bonus(4), mitre.chain_bonus(3))
+        # Pojedynczy sygnał nie dostaje premii - inaczej każdy szum rósłby.
+        self.assertEqual(mitre.chain_bonus(0), 0)
+
+
+class TestCorrelation(unittest.TestCase):
+    def _engine(self, tmp):
+        engine = Engine(make_config(tmp))
+        engine.load(load_yara=False)
+        return engine
+
+    def test_attack_chain_adds_points(self):
+        """Spójny łańcuch sygnałów to coś więcej niż suma części."""
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            result = engine.scan_file(str(SAMPLES / "malicious" / "dropper.ps1"))
+            rules = [f.rule for f in result.findings]
+            self.assertIn("attack_chain", rules, f"brak korelacji: {rules}")
+
+    def test_findings_carry_mitre_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            result = engine.scan_file(str(SAMPLES / "malicious" / "packed_loader.exe"))
+            self.assertTrue(any(f.mitre for f in result.findings),
+                            "żadne znalezisko nie ma przypisanej techniki ATT&CK")
+
+    def test_heuristics_are_discounted_in_system_dirs(self):
+        """Ten sam plik w katalogu systemowym dostaje mniej punktów heurystyki."""
+        import os
+        from avengine.detectors import correlation as corr
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            payload = bytes(range(256)) * 40
+            home = os.path.join(tmp, "home", "user", "payload.bin")
+            os.makedirs(os.path.dirname(home), exist_ok=True)
+            Path(home).write_bytes(payload)
+            result_home = engine.scan_bytes(home, payload)
+
+            usr = os.path.join(tmp, "usr", "bin", "payload.bin")
+            os.makedirs(os.path.dirname(usr), exist_ok=True)
+            original = corr.TRUSTED_DIRS
+            corr.TRUSTED_DIRS = original + (os.path.dirname(usr).lower(),)
+            try:
+                result_usr = engine.scan_bytes(usr, payload)
+            finally:
+                corr.TRUSTED_DIRS = original
+            self.assertLessEqual(result_usr.score, result_home.score,
+                                 "plik w katalogu systemowym powinien dostać rabat")
+
+
+class TestIntegrityScanning(unittest.TestCase):
+    """Testy rootkitów używają syntetycznych katalogów - nie ruszamy /proc."""
+
+    def _scanner(self):
+        from avengine.rootkit import IntegrityScanner
+        return IntegrityScanner()
+
+    def test_ld_so_preload_is_critical(self):
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "ld.so.preload"
+            fake.write_text("/usr/lib/libhide.so\n")
+            original = rootkit.PRELOAD_PATH
+            rootkit.PRELOAD_PATH = fake
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PRELOAD_PATH = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("ld_so_preload", rules)
+
+    def test_hidden_process_is_critical(self):
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            (proc / "999999").mkdir(parents=True)
+            (proc / "999999" / "cmdline").write_bytes(b"/usr/lib/.hidden/kworker\x00")
+            original = rootkit.PROC_PATH
+            rootkit.PROC_PATH = proc
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PROC_PATH = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("hidden_process", rules)
+
+    def test_extra_uid_zero_account(self):
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "passwd"
+            fake.write_text("root:x:0:0:root:/root:/bin/bash\n"
+                            "backdoor:x:0:0::/home/backdoor:/bin/bash\n")
+            original = rootkit.PASSWD_PATH
+            rootkit.PASSWD_PATH = fake
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PASSWD_PATH = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("uid_zero_account", rules)
+
+    def test_suid_binary_in_world_writable_dir(self):
+        import stat as statmod
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / ".evil"
+            target.write_bytes(b"#!/bin/sh\n")
+            target.chmod(target.stat().st_mode | statmod.S_ISUID)
+            original = rootkit.SHADY_EXEC_DIRS
+            rootkit.SHADY_EXEC_DIRS = (str(tmp) + "/",)
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.SHADY_EXEC_DIRS = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("suid_in_writable", rules)
+
+    def test_hidden_socket_check_skipped_without_permissions(self):
+        """Bez prawa odczytu /proc/*/fd test musi odpuścić, a nie alarmować."""
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            (proc / "1").mkdir(parents=True)
+            net = proc / "net"
+            net.mkdir()
+            (net / "tcp").write_text(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+                "   uid  timeout inode\n"
+                "   0: 00000000:006F 00000000:0000 0A 00000000:00000000 00:00000000 00000000"
+                "     0        0 422 1 0000000000000000 100 0 0 10 0\n")
+            original_proc, original_net = rootkit.PROC_PATH, rootkit.NET_TCP_PATHS
+            rootkit.PROC_PATH = proc
+            rootkit.NET_TCP_PATHS = (net / "tcp",)
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PROC_PATH = original_proc
+                rootkit.NET_TCP_PATHS = original_net
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertNotIn("hidden_port", rules,
+                             "fałszywy alarm: gniazdka bez widocznych deskryptorów")
+            self.assertTrue(any("hidden_sockets" in s for s in report["skipped"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -455,6 +666,217 @@ class TestYaraSuppression(unittest.TestCase):
             # Reguła "domain" pasuje do danych losowych - musi zostać odrzucona.
             if engine.store.yara.rules or engine.store.yara.info_rules:
                 self.assertIn("domain", engine.store.yara.noisy_rules)
+
+
+
+SAMPLES = Path(__file__).resolve().parent.parent / "samples"
+
+
+class TestDocumentAnalysis(unittest.TestCase):
+    """Dokumenty to dziś główny wektor infekcji - muszą być analizowane."""
+
+    def _engine(self, tmp):
+        engine = Engine(make_config(tmp))
+        engine.load(load_yara=False)
+        return engine
+
+    def _scan(self, tmp, path: Path):
+        return self._engine(tmp).scan_file(str(path))
+
+    def test_pdf_with_javascript_and_openaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "malicious" / "raport.pdf")
+            rules = [f.rule for f in result.findings]
+            self.assertIn("pdf_js_auto", rules, f"nie wykryto: {rules}")
+            self.assertEqual(result.verdict, Verdict.MALICIOUS.value)
+
+    def test_clean_pdf_stays_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "clean" / "dokument.pdf")
+            doc_findings = [f.rule for f in result.findings if f.detector == "documents"]
+            self.assertEqual(doc_findings, [], f"fałszywy alarm: {doc_findings}")
+            self.assertEqual(result.verdict, Verdict.CLEAN.value)
+
+    def test_ooxml_macro_is_detected_with_details(self):
+        """Makro musi być nie tylko wykryte, ale i opisane (co robi)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "malicious" / "faktura.docm")
+            rules = [f.rule for f in result.findings]
+            self.assertIn("ooxml_macro", rules, f"nie wykryto makra: {rules}")
+            # Szczegóły są ważniejsze od samej flagi: analityk musi wiedzieć,
+            # że makro uruchamia się samo i pobiera coś z sieci.
+            self.assertIn("vba_autorun", rules)
+            self.assertIn("macro_download", rules)
+
+    def test_clean_docx_stays_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._scan(tmp, SAMPLES / "clean" / "raport.docx")
+            doc_findings = [f.rule for f in result.findings if f.detector == "documents"]
+            self.assertEqual(doc_findings, [], f"fałszywy alarm: {doc_findings}")
+
+
+class TestMitreMapping(unittest.TestCase):
+    def test_known_techniques_are_mapped(self):
+        from avengine import mitre
+        cases = {
+            ("pe_heuristics", "api_hollowing"): "T1055.012",
+            ("pe_heuristics", "api_ransomware"): "T1486",
+            ("documents", "pdf_js_auto"): "T1204.002",
+            ("rootkit", "ld_so_preload"): "T1574.006",
+            ("archive", "nested_threat"): "T1566.001",
+        }
+        for (detector, rule), expected in cases.items():
+            technique = mitre.map_finding(detector, rule)
+            self.assertIsNotNone(technique, f"{detector}/{rule} nie zmapowane")
+            self.assertEqual(technique.id, expected)
+
+    def test_chain_bonus_grows_with_distinct_tactics(self):
+        from avengine import mitre
+        self.assertEqual(mitre.chain_bonus(1), 0)
+        self.assertEqual(mitre.chain_bonus(2), 5)
+        self.assertEqual(mitre.chain_bonus(3), 12)
+        self.assertGreater(mitre.chain_bonus(4), mitre.chain_bonus(3))
+        # Pojedynczy sygnał nie dostaje premii - inaczej każdy szum rósłby.
+        self.assertEqual(mitre.chain_bonus(0), 0)
+
+
+class TestCorrelation(unittest.TestCase):
+    def _engine(self, tmp):
+        engine = Engine(make_config(tmp))
+        engine.load(load_yara=False)
+        return engine
+
+    def test_attack_chain_adds_points(self):
+        """Spójny łańcuch sygnałów to coś więcej niż suma części."""
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            result = engine.scan_file(str(SAMPLES / "malicious" / "dropper.ps1"))
+            rules = [f.rule for f in result.findings]
+            self.assertIn("attack_chain", rules, f"brak korelacji: {rules}")
+
+    def test_findings_carry_mitre_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            result = engine.scan_file(str(SAMPLES / "malicious" / "packed_loader.exe"))
+            self.assertTrue(any(f.mitre for f in result.findings),
+                            "żadne znalezisko nie ma przypisanej techniki ATT&CK")
+
+    def test_heuristics_are_discounted_in_system_dirs(self):
+        """Ten sam plik w katalogu systemowym dostaje mniej punktów heurystyki."""
+        import os
+        from avengine.detectors import correlation as corr
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._engine(tmp)
+            payload = bytes(range(256)) * 40
+            home = os.path.join(tmp, "home", "user", "payload.bin")
+            os.makedirs(os.path.dirname(home), exist_ok=True)
+            Path(home).write_bytes(payload)
+            result_home = engine.scan_bytes(home, payload)
+
+            usr = os.path.join(tmp, "usr", "bin", "payload.bin")
+            os.makedirs(os.path.dirname(usr), exist_ok=True)
+            original = corr.TRUSTED_DIRS
+            corr.TRUSTED_DIRS = original + (os.path.dirname(usr).lower(),)
+            try:
+                result_usr = engine.scan_bytes(usr, payload)
+            finally:
+                corr.TRUSTED_DIRS = original
+            self.assertLessEqual(result_usr.score, result_home.score,
+                                 "plik w katalogu systemowym powinien dostać rabat")
+
+
+class TestIntegrityScanning(unittest.TestCase):
+    """Testy rootkitów używają syntetycznych katalogów - nie ruszamy /proc."""
+
+    def _scanner(self):
+        from avengine.rootkit import IntegrityScanner
+        return IntegrityScanner()
+
+    def test_ld_so_preload_is_critical(self):
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "ld.so.preload"
+            fake.write_text("/usr/lib/libhide.so\n")
+            original = rootkit.PRELOAD_PATH
+            rootkit.PRELOAD_PATH = fake
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PRELOAD_PATH = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("ld_so_preload", rules)
+
+    def test_hidden_process_is_critical(self):
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            (proc / "999999").mkdir(parents=True)
+            (proc / "999999" / "cmdline").write_bytes(b"/usr/lib/.hidden/kworker\x00")
+            original = rootkit.PROC_PATH
+            rootkit.PROC_PATH = proc
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PROC_PATH = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("hidden_process", rules)
+
+    def test_extra_uid_zero_account(self):
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "passwd"
+            fake.write_text("root:x:0:0:root:/root:/bin/bash\n"
+                            "backdoor:x:0:0::/home/backdoor:/bin/bash\n")
+            original = rootkit.PASSWD_PATH
+            rootkit.PASSWD_PATH = fake
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PASSWD_PATH = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("uid_zero_account", rules)
+
+    def test_suid_binary_in_world_writable_dir(self):
+        import stat as statmod
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / ".evil"
+            target.write_bytes(b"#!/bin/sh\n")
+            target.chmod(target.stat().st_mode | statmod.S_ISUID)
+            original = rootkit.SHADY_EXEC_DIRS
+            rootkit.SHADY_EXEC_DIRS = (str(tmp) + "/",)
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.SHADY_EXEC_DIRS = original
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertIn("suid_in_writable", rules)
+
+    def test_hidden_socket_check_skipped_without_permissions(self):
+        """Bez prawa odczytu /proc/*/fd test musi odpuścić, a nie alarmować."""
+        from avengine import rootkit
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            (proc / "1").mkdir(parents=True)
+            net = proc / "net"
+            net.mkdir()
+            (net / "tcp").write_text(
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+                "   uid  timeout inode\n"
+                "   0: 00000000:006F 00000000:0000 0A 00000000:00000000 00:00000000 00000000"
+                "     0        0 422 1 0000000000000000 100 0 0 10 0\n")
+            original_proc, original_net = rootkit.PROC_PATH, rootkit.NET_TCP_PATHS
+            rootkit.PROC_PATH = proc
+            rootkit.NET_TCP_PATHS = (net / "tcp",)
+            try:
+                report = self._scanner().scan()
+            finally:
+                rootkit.PROC_PATH = original_proc
+                rootkit.NET_TCP_PATHS = original_net
+            rules = [f["rule"] for f in report["findings"]]
+            self.assertNotIn("hidden_port", rules,
+                             "fałszywy alarm: gniazdka bez widocznych deskryptorów")
+            self.assertTrue(any("hidden_sockets" in s for s in report["skipped"]))
 
 
 if __name__ == "__main__":

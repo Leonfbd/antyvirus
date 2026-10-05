@@ -41,10 +41,19 @@ class ScanContext:
 
 
 class Detector:
-    """Bazowa klasa detektora. Nadpisz `applies_to` i `run`."""
+    """Bazowa klasa detektora. Nadpisz `applies_to` i `run`.
+
+    `expensive = True` oznacza warstwę kosztowną obliczeniowo (YARA, skan
+    archiwów, heurystyka PE). Gdy inna warstwa rozpozna plik z pewnością
+    (trafienie warte 100 pkt), kosztowne warstwy są pomijane - ale tanie,
+    które dodają KONTEKST do raportu (dokumenty, korelacja), uruchamiają się
+    nadal. Bez tego raport dla złośliwego .docm kończyłby się na jednym
+    znalezisku, zamiast wytłumaczyć, co właściwie znaleziono.
+    """
 
     name = "base"
     description = ""
+    expensive = True
 
     def applies_to(self, ctx: ScanContext) -> bool:
         return True

@@ -174,6 +174,14 @@ class AVWebApp:
         def startup(refresh: int = 0):
             return self._cached("startup", refresh)
 
+        @app.get("/api/integrity")
+        def integrity():
+            from ..rootkit import IntegrityScanner
+            try:
+                return IntegrityScanner(self.engine).scan()
+            except Exception as exc:
+                raise HTTPException(500, f"Kontrola integralności nie powiodła się: {exc}")
+
         @app.get("/api/report/{job_id}")
         def report(job_id: str, fmt: str = "html"):
             job = self.jobs.get(job_id)

@@ -44,6 +44,7 @@ class Finding:
     description: str
     weight: int = 0
     evidence: Optional[str] = None
+    mitre: Optional[str] = None       # np. "T1055.012 Process Hollowing"
 
     def __post_init__(self) -> None:
         if not self.weight:

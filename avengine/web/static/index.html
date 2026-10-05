@@ -29,6 +29,7 @@
   <button class="tab" data-tab="quarantine">Kwarantanna</button>
   <button class="tab" data-tab="processes">Procesy</button>
   <button class="tab" data-tab="startup">Autostart</button>
+  <button class="tab" data-tab="integrity">Integralność</button>
   <button class="tab" data-tab="sigs">Sygnatury</button>
   <button class="tab" data-tab="settings">Ustawienia</button>
 </nav>
@@ -179,6 +180,32 @@
         bez pytania użytkownika — wraz z oceną tego, co z nich wystartuje.</p>
       <div id="startSummary" class="cards" style="margin-top:12px"></div>
       <div id="startList"></div>
+    </div>
+  </section>
+
+  <!-- ======================== INTEGRALNOŚĆ ========================= -->
+  <section id="integrity" class="tab-panel">
+    <div class="card">
+      <div class="card-head">
+        <h2>Integralność systemu</h2>
+        <button class="btn btn-ghost" id="btnRefreshIntegrity">Sprawdź ponownie</button>
+      </div>
+      <p class="note">Konfrontujemy dwa źródła prawdy o systemie: to, co widać w
+        <code>/proc</code>, z tym, co zgłasza API. Rozbieżność oznacza, że coś
+        ukrywa się przed narzędziami — czyli rootkit. Osobno pokazujemy
+        <strong>słabą konfigurację</strong>: to podatność, nie dowód infekcji.</p>
+      <div id="integSummary" class="cards" style="margin-top:12px"></div>
+      <div id="integList"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Słaba konfiguracja (hartowanie)</h2></div>
+      <div id="integHardening"></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Poza zasięgiem tego narzędzia</h2></div>
+      <p class="note">Uczciwie: bez sterownika kernelowego poniższe techniki
+        pozostają niewidoczne. Komercyjne antywirusy mają tu przewagę.</p>
+      <div id="integNotCovered"></div>
     </div>
   </section>
 

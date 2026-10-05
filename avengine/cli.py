@@ -430,6 +430,49 @@ def cmd_startup(args: argparse.Namespace) -> int:
     return 1 if counts["malicious"] else 0
 
 
+def cmd_integrity(args: argparse.Namespace) -> int:
+    """Kontrola integralności systemu (techniki rootkitów)."""
+    cfg = Config()
+    cfg.ensure_dirs()
+    engine = Engine(cfg)
+    engine.load(load_yara=not args.no_yara)
+    from .rootkit import IntegrityScanner
+
+    if not args.json:
+        print("Kontrola integralności systemu…\n")
+    report = IntegrityScanner(engine).scan()
+
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 1 if report["counts"]["critical"] else 0
+
+    if not report["findings"]:
+        print("Nie wykryto oznak naruszenia integralności.\n")
+    for f in report["findings"]:
+        label = _color(f["severity"].upper(), "malicious" if f["severity"] == "critical"
+                       else "suspicious" if f["severity"] == "high" else "clean")
+        print(f"{label} +{f['weight']:<3} {f['rule']}")
+        print(f"   {f['description']}")
+        if f["evidence"]:
+            print(f"   ↳ {f['evidence'][:200]}")
+        print()
+
+    if report["hardening"]:
+        print("Słaba konfiguracja (podatności, nie infekcja):")
+        for f in report["hardening"]:
+            print(f"  - [{f['severity']:<8}] {f['rule']}: {f['description']}")
+        print()
+
+    print(f"Sprawdzono: {len(report['checked'])} testów"
+          + (f" · pominięto: {len(report['skipped'])}" if report["skipped"] else ""))
+    if report["skipped"]:
+        print(f"  ({', '.join(report['skipped'][:6])})")
+    print("\nPoza zasięgiem (wymagają sterownika kernelowego):")
+    for item in report["not_covered"]:
+        print(f"  - {item}")
+    return 1 if report["counts"]["critical"] else 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     """Skan + raport HTML/JSON do pliku."""
     cfg = Config()
@@ -534,6 +577,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--all", action="store_true", help="pokaż też wpisy bez ryzyka")
     p.add_argument("--limit", type=int, default=40)
     p.set_defaults(func=cmd_startup)
+
+    # integrity
+    p = sub.add_parser("integrity", aliases=["rootkit"],
+                       help="kontrola integralności systemu (rootkity)")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-yara", action="store_true")
+    p.set_defaults(func=cmd_integrity)
 
     # report
     p = sub.add_parser("report", help="skan + raport HTML/JSON")

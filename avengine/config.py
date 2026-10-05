@@ -28,6 +28,13 @@ class Config:
     max_workers: int = 8
 
     # --- archiwa (ochrona przed bombami zip i wykładniczym zagnieżdżeniem) ---
+    # --- precyzja ---
+    # Heurystyka statystyczna w katalogach systemowych ma najwyższy odsetek
+    # fałszywych alarmów, więc tam ją rabatuijemy. Sygnatury exact-match
+    # (hasz, ClamAV, reguły malware YARA) rabatu nie podlegają.
+    trust_system_dirs: bool = True
+    system_dir_discount: float = 0.5
+
     # --- wydajność ---
     # ssdeep to czysty Python: ~11 s dla 12 MB. Liczymy go tylko wtedy, gdy
     # baza zawiera hasze fuzzy (inaczej i tak nikt go nie użyje).
